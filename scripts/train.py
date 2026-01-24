@@ -27,12 +27,12 @@ def main():
         "audio_dir": "/mnt/data/working_datasets/jamendo",
         "input_dirs": ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09"],
         "ext": "mp3",
-        "batch_size": 16,
+        "batch_size": 8,  # Reducido de 16 para menor uso de memoria
         "num_workers": 0,
         "audio_length": 65536,
         "train_examples_per_epoch": 5000,
         "val_examples_per_epoch": 500,
-        "buffer_size_gb": 0.5,
+        "buffer_size_gb": 0.2,  # Reducido de 0.5 para menor uso de memoria
         "buffer_reload_rate": 2000,
 
         # Modelo

@@ -172,7 +172,7 @@ class TapeIdentificationTrainer:
         return avg_loss
 
     def save_checkpoint(self, is_best: bool = False, emergency: bool = False):
-        """Guarda checkpoint."""
+        """Guarda checkpoint (solo last y best para ahorrar espacio)."""
         checkpoint = {
             "epoch": self.current_epoch,
             "encoder_state": self.encoder.state_dict(),
@@ -183,12 +183,12 @@ class TapeIdentificationTrainer:
             "global_step": self.global_step,
         }
 
-        # Guardar último
+        # Guardar último checkpoint (siempre sobrescribe)
         if emergency:
             last_path = self.output_dir / f"checkpoint_epoch{self.current_epoch}_emergency.pt"
             logging.warning(f"Saving emergency checkpoint to {last_path}")
         else:
-            last_path = self.output_dir / f"checkpoint_epoch{self.current_epoch}.pt"
+            last_path = self.output_dir / "last_checkpoint.pt"
 
         torch.save(checkpoint, last_path)
 
