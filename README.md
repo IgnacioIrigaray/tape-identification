@@ -251,15 +251,3 @@ See [LICENSE](LICENSE) for details.
 - **DeepAFx-ST Repository**: https://github.com/adobe-research/DeepAFx-ST
 - **MobileNetV2**: [Inverted Residuals and Linear Bottlenecks](https://arxiv.org/abs/1801.04381)
 
-## Citation
-
-If you use this code, please cite the original DeepAFx-ST work:
-
-```bibtex
-@inproceedings{steinmetz2022style,
-  title={Style transfer of audio effects with differentiable signal processing},
-  author={Steinmetz, Christian J and Bryan, Nicholas J and Reiss, Joshua D},
-  booktitle={Journal of the Audio Engineering Society},
-  year={2022}
-}
-```
