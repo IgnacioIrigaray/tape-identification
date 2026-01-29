@@ -11,13 +11,13 @@ from typing import Optional
 
 class ParameterController(nn.Module):
     """
-    Controlador que predice parámetros de tape desde embeddings de audio.
+    Controlador que predice clases de parámetros desde embeddings de audio.
 
-    Toma embeddings de input (x) y target (y) y predice los parámetros
-    que transforman x en y.
+    Toma embeddings de input (x) y target (y) y predice logits para N clases
+    que representan valores discretos del parámetro.
 
     Args:
-        num_params: Número de parámetros a predecir (1 para tape saturation)
+        num_classes: Número de clases discretas a predecir (default: 10)
         embed_dim: Dimensión de los embeddings del encoder
         hidden_dim: Dimensión oculta del MLP predictor
         agg_method: Método de agregación de embeddings ["mlp", "linear"]
@@ -25,13 +25,13 @@ class ParameterController(nn.Module):
 
     def __init__(
         self,
-        num_params: int = 1,
+        num_classes: int = 10,
         embed_dim: int = 128,
         hidden_dim: int = 256,
         agg_method: str = "mlp",
     ):
         super().__init__()
-        self.num_params = num_params
+        self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
         self.agg_method = agg_method
@@ -46,14 +46,16 @@ class ParameterController(nn.Module):
         else:
             raise ValueError(f"Invalid agg_method: {agg_method}")
 
-        # MLP predictor de parámetros
+        # MLP predictor de clases (logits, sin activación final)
         self.mlp = nn.Sequential(
             nn.Linear(mlp_in_dim, hidden_dim),
             nn.LeakyReLU(0.01),
+            nn.Dropout(0.3),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.01),
-            nn.Linear(hidden_dim, num_params),
-            nn.Sigmoid(),  # Normaliza a [0, 1]
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, num_classes),
+            # Sin Sigmoid - retorna logits para softmax en processor
         )
 
     def forward(
@@ -63,7 +65,7 @@ class ParameterController(nn.Module):
         z: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Predice parámetros desde embeddings.
+        Predice logits de clases desde embeddings.
 
         Args:
             e_x: Embedding del audio input [batch, embed_dim]
@@ -71,7 +73,7 @@ class ParameterController(nn.Module):
             z: Bottleneck latent (no usado, para compatibilidad)
 
         Returns:
-            Parámetros normalizados [batch, num_params] en rango [0, 1]
+            Logits para clasificación [batch, num_classes]
         """
         # Agregar embeddings
         if self.agg_method == "linear":

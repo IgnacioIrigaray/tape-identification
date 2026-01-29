@@ -13,13 +13,15 @@ from tape_id.models import (
     ParameterController,
     TapeSaturationProcessor,
     apply_tape_saturation,
+    HardClippingProcessor,
+    apply_hard_clipping,
 )
 
 
 def test_encoder():
     """Test encoder forward pass."""
     print("Testing SpectralEncoder...")
-    encoder = SpectralEncoder(num_params=1, embed_dim=128, width_mult=2)
+    encoder = SpectralEncoder(num_params=1, sample_rate=24000, embed_dim=128, width_mult=2)
     x = torch.randn(2, 1, 24000)  # [batch, channels, samples]
     e = encoder(x)
     assert e.shape == (2, 128), f"Expected (2, 128), got {e.shape}"
@@ -29,22 +31,23 @@ def test_encoder():
 def test_controller():
     """Test controller forward pass."""
     print("Testing ParameterController...")
-    controller = ParameterController(num_params=1, embed_dim=128)
+    num_classes = 3
+    controller = ParameterController(num_classes=num_classes, embed_dim=128)
     e_x = torch.randn(2, 128)
     e_y = torch.randn(2, 128)
-    p = controller(e_x, e_y)
-    assert p.shape == (2, 1), f"Expected (2, 1), got {p.shape}"
-    assert (p >= 0).all() and (p <= 1).all(), "Parameters should be in [0, 1]"
+    logits = controller(e_x, e_y)
+    assert logits.shape == (2, num_classes), f"Expected (2, {num_classes}), got {logits.shape}"
     print("✓ Controller OK")
 
 
 def test_processor():
     """Test processor forward pass."""
     print("Testing TapeSaturationProcessor...")
-    processor = TapeSaturationProcessor(min_depth=1.0, max_depth=10.0)
+    num_classes = 3
+    processor = TapeSaturationProcessor(min_gain=1.0, max_gain=10.0, num_classes=num_classes)
     x = torch.randn(2, 1, 24000)
-    p = torch.rand(2, 1)  # [0, 1]
-    y = processor(x, p)
+    logits = torch.randn(2, num_classes)  # [batch, num_classes]
+    y = processor(x, logits)
     assert y.shape == x.shape, f"Expected {x.shape}, got {y.shape}"
     print("✓ Processor OK")
 
@@ -53,18 +56,43 @@ def test_apply_saturation():
     """Test saturation function."""
     print("Testing apply_tape_saturation...")
     x = torch.randn(24000)
-    y = apply_tape_saturation(x, depth=5.0)
+    y = apply_tape_saturation(x, gain=5.0)
     assert y.shape == x.shape
     assert y.abs().max() <= 1.0, "Tanh should bound output to [-1, 1]"
     print("✓ Saturation function OK")
 
 
+def test_hard_clipping_processor():
+    """Test hard clipping processor."""
+    print("Testing HardClippingProcessor...")
+    num_classes = 3
+    processor = HardClippingProcessor(min_gain=1.0, max_gain=4.0, num_classes=num_classes)
+    x = torch.randn(2, 1, 24000)
+    logits = torch.randn(2, num_classes)
+    y = processor(x, logits)
+    assert y.shape == x.shape, f"Expected {x.shape}, got {y.shape}"
+    assert y.abs().max() <= 1.0, "Hard clipping should bound output to [-1, 1]"
+    print("✓ HardClippingProcessor OK")
+
+
+def test_hard_clipping_bypass():
+    """Test that gain=1 is bypass."""
+    print("Testing hard clipping bypass (gain=1)...")
+    x = torch.randn(24000)
+    y = apply_hard_clipping(x.clamp(-0.5, 0.5), 1.0)  # Use small input to avoid clipping
+    x_clamped = x.clamp(-0.5, 0.5)
+    mse = ((x_clamped - y) ** 2).mean()
+    assert mse < 1e-6, f"gain=1 should be bypass, but MSE={mse}"
+    print("✓ Hard clipping bypass OK")
+
+
 def test_full_pipeline():
     """Test full forward pass."""
     print("\nTesting full pipeline...")
-    encoder = SpectralEncoder(num_params=1, embed_dim=128, width_mult=2)
-    controller = ParameterController(num_params=1, embed_dim=128)
-    processor = TapeSaturationProcessor(min_depth=1.0, max_depth=10.0)
+    num_classes = 3
+    encoder = SpectralEncoder(num_params=1, sample_rate=24000, embed_dim=128, width_mult=2)
+    controller = ParameterController(num_classes=num_classes, embed_dim=128)
+    processor = TapeSaturationProcessor(min_gain=1.0, max_gain=10.0, num_classes=num_classes)
 
     # Input audio
     x = torch.randn(2, 1, 24000)
@@ -73,8 +101,8 @@ def test_full_pipeline():
     # Forward
     e_x = encoder(x)
     e_y = encoder(y_target)
-    p = controller(e_x, e_y)
-    y_pred = processor(x, p)
+    logits = controller(e_x, e_y)
+    y_pred = processor(x, logits)
 
     assert y_pred.shape == x.shape
     print("✓ Full pipeline OK")
@@ -86,5 +114,7 @@ if __name__ == "__main__":
     test_controller()
     test_processor()
     test_apply_saturation()
+    test_hard_clipping_processor()
+    test_hard_clipping_bypass()
     test_full_pipeline()
     print("\n✅ All tests passed!")

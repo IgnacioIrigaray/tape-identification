@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 from tape_id.models.encoder import SpectralEncoder
 from tape_id.models.controller import ParameterController
-from tape_id.models.tape_processor import TapeSaturationProcessor
+from tape_id.models.tape_processor import HardClippingProcessor
 from tape_id.data.dataset import TapeSaturationDataset
 from tape_id.training.losses import MultiResolutionSTFTLoss
 from tape_id.training.trainer import TapeIdentificationTrainer
@@ -36,13 +36,16 @@ def main():
         "buffer_reload_rate": 2000,
 
         # Modelo
-        "embed_dim": 128,
+        "embed_dim": 1024,
         "hidden_dim": 256,
-        "min_depth": 1.0,
-        "max_depth": 10.0,
+        "min_gain": 1.0,  # Hard clipping: gain=1 es bypass
+        "max_gain": 4.0,  # gain=4 es clipping severo
+        "num_classes": 3,
+        "saturation_model": "hard_clipping",
+        "log_scale": False,
 
         # Training
-        "num_epochs": 50,
+        "num_epochs": 100,
         "learning_rate": 3e-4,
         "device": "cuda",  # GPU no compatible con PyTorch actual (sm_86)
 
@@ -63,8 +66,11 @@ def main():
         ext=config["ext"],
         subset="train",
         length=config["audio_length"],
-        min_depth=config["min_depth"],
-        max_depth=config["max_depth"],
+        min_param=config["min_gain"],
+        max_param=config["max_gain"],
+        num_classes=config["num_classes"],
+        saturation_model=config["saturation_model"],
+        log_scale=config["log_scale"],
         num_examples_per_epoch=config["train_examples_per_epoch"],
         buffer_size_gb=config["buffer_size_gb"],
         buffer_reload_rate=config["buffer_reload_rate"],
@@ -76,8 +82,11 @@ def main():
         ext=config["ext"],
         subset="val",
         length=config["audio_length"],
-        min_depth=config["min_depth"],
-        max_depth=config["max_depth"],
+        min_param=config["min_gain"],
+        max_param=config["max_gain"],
+        num_classes=config["num_classes"],
+        saturation_model=config["saturation_model"],
+        log_scale=config["log_scale"],
         num_examples_per_epoch=config["val_examples_per_epoch"],
         buffer_size_gb=config["buffer_size_gb"],
         buffer_reload_rate=config["buffer_reload_rate"],
@@ -120,14 +129,15 @@ def main():
     )
 
     controller = ParameterController(
-        num_params=1,
+        num_classes=config["num_classes"],
         embed_dim=config["embed_dim"],
         hidden_dim=config["hidden_dim"],
     )
 
-    processor = TapeSaturationProcessor(
-        min_depth=config["min_depth"],
-        max_depth=config["max_depth"],
+    processor = HardClippingProcessor(
+        min_gain=config["min_gain"],
+        max_gain=config["max_gain"],
+        num_classes=config["num_classes"],
     )
 
     # Mostrar resumen del modelo
@@ -141,7 +151,20 @@ def main():
         + list(controller.parameters())
         + list(processor.parameters())
     )
-    optimizer = torch.optim.Adam(params, lr=config["learning_rate"])
+    optimizer = torch.optim.Adam(
+        params,
+        lr=config["learning_rate"],
+        weight_decay=1e-5  # L2 regularization para reducir overfitting
+    )
+
+    # Learning rate scheduler - reduce LR cuando validation se estanca
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=5,
+        verbose=True
+    )
 
     # Crear trainer
     trainer = TapeIdentificationTrainer(
@@ -152,6 +175,7 @@ def main():
         val_loader=val_loader,
         loss_fn=loss_fn,
         optimizer=optimizer,
+        scheduler=scheduler,
         device=config["device"],
         output_dir=config["output_dir"],
         log_dir=config["log_dir"],

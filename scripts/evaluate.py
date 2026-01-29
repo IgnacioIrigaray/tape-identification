@@ -10,20 +10,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch
 import torchaudio
 import argparse
-from typing import Tuple
 
 from tape_id.models.encoder import SpectralEncoder
 from tape_id.models.controller import ParameterController
-from tape_id.models.tape_processor import TapeSaturationProcessor, apply_tape_saturation
+from tape_id.models.tape_processor import HardClippingProcessor, apply_hard_clipping
 
 
-def load_model(checkpoint_path: str, device: str = "cuda"):
+def load_model(checkpoint_path: str, device: str = "cuda", num_classes: int = 3):
     """Carga modelo desde checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    encoder = SpectralEncoder(num_params=1, embed_dim=128, width_mult=2).to(device)
-    controller = ParameterController(num_params=1, embed_dim=128).to(device)
-    processor = TapeSaturationProcessor(min_depth=1.0, max_depth=10.0).to(device)
+    encoder = SpectralEncoder(num_params=1, sample_rate=24000, embed_dim=1024, width_mult=2).to(device)
+    controller = ParameterController(num_classes=num_classes, embed_dim=1024, hidden_dim=256).to(device)
+    processor = HardClippingProcessor(min_gain=1.0, max_gain=4.0, num_classes=num_classes).to(device)
 
     encoder.load_state_dict(checkpoint["encoder_state"])
     controller.load_state_dict(checkpoint["controller_state"])
@@ -42,6 +41,7 @@ def estimate_parameter(
     audio_saturated: torch.Tensor,
     encoder,
     controller,
+    processor,
     device: str,
 ) -> float:
     """
@@ -52,26 +52,21 @@ def estimate_parameter(
         audio_saturated: Audio saturado [samples]
         encoder: Encoder model
         controller: Controller model
+        processor: Processor model
         device: Device
 
     Returns:
-        Parámetro estimado [1, 10]
+        Parámetro estimado
     """
-    # Preparar tensores
-    x = audio.unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, samples]
+    x = audio.unsqueeze(0).unsqueeze(0).to(device)
     y = audio_saturated.unsqueeze(0).unsqueeze(0).to(device)
 
-    # Obtener embeddings
     e_x = encoder(x)
     e_y = encoder(y)
+    logits = controller(e_x, e_y)
+    param = processor.get_gain_from_logits(logits, use_argmax=True)
 
-    # Predecir parámetro
-    p_norm = controller(e_x, e_y)  # [0, 1]
-
-    # Desnormalizar
-    p_real = 1.0 + p_norm[0, 0].item() * 9.0
-
-    return p_real
+    return param[0].item()
 
 
 def main():
@@ -79,17 +74,17 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
     parser.add_argument("--audio", type=str, help="Path to audio file (optional)")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
+    parser.add_argument("--num_classes", type=int, default=3, help="Number of discrete classes")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Cargar modelo
     print(f"Loading model from {args.checkpoint}...")
-    encoder, controller, processor = load_model(args.checkpoint, device)
-    print("Model loaded successfully!")
+    encoder, controller, processor = load_model(args.checkpoint, device, args.num_classes)
+    print(f"Model loaded successfully! (num_classes={args.num_classes})")
+    print(f"gain_values: {processor.gain_values.tolist()}")
 
-    # Prueba con audio sintético si no se proporciona
     if args.audio is None:
         print("\nGenerating synthetic audio for testing...")
         sr = 24000
@@ -110,34 +105,31 @@ def main():
             audio = audio.squeeze(0)
         audio = audio / audio.abs().max()
 
-    # Tomar 3 segundos
     max_samples = 24000 * 3
     if audio.shape[0] > max_samples:
         audio = audio[:max_samples]
 
     print(f"Audio shape: {audio.shape}")
 
-    # Probar con diferentes depths
+    # Test con los valores de gain del procesador
+    test_params = processor.gain_values.tolist()
+
     print("\n" + "=" * 60)
-    print("PARAMETER ESTIMATION TEST")
+    print("PARAMETER ESTIMATION TEST (Hard Clipping)")
     print("=" * 60)
-    print(f"{'Real Depth':>12} | {'Estimated':>12} | {'Error':>10}")
+    print(f"{'Real gain':>12} | {'Estimated':>12} | {'Error':>10}")
     print("-" * 60)
 
-    test_depths = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
     errors = []
 
-    for real_depth in test_depths:
-        # Aplicar saturación
-        audio_sat = apply_tape_saturation(audio, real_depth)
+    for real_param in test_params:
+        audio_sat = apply_hard_clipping(audio, real_param)
+        estimated = estimate_parameter(audio, audio_sat, encoder, controller, processor, device)
 
-        # Estimar parámetro
-        estimated = estimate_parameter(audio, audio_sat, encoder, controller, device)
-
-        error = abs(real_depth - estimated)
+        error = abs(real_param - estimated)
         errors.append(error)
 
-        print(f"{real_depth:>12.2f} | {estimated:>12.4f} | {error:>10.4f}")
+        print(f"{real_param:>12.3f} | {estimated:>12.3f} | {error:>10.4f}")
 
     print("-" * 60)
     print(f"Average error: {sum(errors) / len(errors):.4f}")

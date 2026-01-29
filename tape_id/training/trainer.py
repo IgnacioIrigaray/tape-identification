@@ -39,6 +39,7 @@ class TapeIdentificationTrainer:
         val_loader: DataLoader,
         loss_fn: nn.Module,
         optimizer: torch.optim.Optimizer,
+        scheduler=None,
         device: str = "cuda",
         output_dir: str = "outputs/checkpoints",
         log_dir: str = "outputs/logs",
@@ -50,6 +51,7 @@ class TapeIdentificationTrainer:
         self.val_loader = val_loader
         self.loss_fn = loss_fn.to(device)
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.device = device
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -62,6 +64,11 @@ class TapeIdentificationTrainer:
         self.current_epoch = 0
         self.best_val_loss = float("inf")
         self.global_step = 0
+
+        # Early stopping
+        self.patience = 15
+        self.patience_counter = 0
+        self.min_delta = 0.001
 
         # Configurar logging
         log_file = self.output_dir / "training.log"
@@ -93,11 +100,11 @@ class TapeIdentificationTrainer:
             e_x = self.encoder(x)
             e_y = self.encoder(y)
 
-            # 2. Predecir parámetros
-            p = self.controller(e_x, e_y)
+            # 2. Predecir logits de clasificación
+            logits = self.controller(e_x, e_y)
 
-            # 3. Aplicar procesador
-            y_pred = self.processor(x, p)
+            # 3. Aplicar procesador (usa softmax + expected value en training)
+            y_pred = self.processor(x, logits, use_argmax=False)
 
             # 4. Calcular loss
             loss = self.loss_fn(y_pred.squeeze(1), y.squeeze(1))
@@ -105,6 +112,15 @@ class TapeIdentificationTrainer:
             # Backward
             self.optimizer.zero_grad()
             loss.backward()
+
+            # Gradient clipping para estabilidad
+            torch.nn.utils.clip_grad_norm_(
+                list(self.encoder.parameters()) +
+                list(self.controller.parameters()) +
+                list(self.processor.parameters()),
+                max_norm=1.0
+            )
+
             self.optimizer.step()
 
             total_loss += loss.item()
@@ -112,20 +128,19 @@ class TapeIdentificationTrainer:
             # TensorBoard logging
             self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
 
-            # Loggear estadísticas de parámetros predichos
-            # p está en rango [0, 1], desnormalizar a [1, 10] para logging
-            depth_pred = 1.0 + p * 9.0
-            self.writer.add_scalar("train/depth_mean", depth_pred.mean().item(), self.global_step)
-            self.writer.add_scalar("train/depth_std", depth_pred.std().item(), self.global_step)
-            self.writer.add_scalar("train/depth_min", depth_pred.min().item(), self.global_step)
-            self.writer.add_scalar("train/depth_max", depth_pred.max().item(), self.global_step)
+            # Loggear estadísticas de gain predicho (expected value)
+            gain_pred = self.processor.get_gain_from_logits(logits, use_argmax=False)
+            self.writer.add_scalar("train/gain_mean", gain_pred.mean().item(), self.global_step)
+            self.writer.add_scalar("train/gain_std", gain_pred.std().item(), self.global_step)
+            self.writer.add_scalar("train/gain_min", gain_pred.min().item(), self.global_step)
+            self.writer.add_scalar("train/gain_max", gain_pred.max().item(), self.global_step)
 
             # Loggear learning rate
             current_lr = self.optimizer.param_groups[0]['lr']
             self.writer.add_scalar("train/learning_rate", current_lr, self.global_step)
 
             self.global_step += 1
-            pbar.set_postfix({"loss": loss.item(), "depth_mean": depth_pred.mean().item()})
+            pbar.set_postfix({"loss": loss.item(), "gain_mean": gain_pred.mean().item()})
 
         return total_loss / len(self.train_loader)
 
@@ -137,7 +152,7 @@ class TapeIdentificationTrainer:
         self.processor.eval()
 
         total_loss = 0.0
-        all_depth_preds = []
+        all_gain_preds = []
 
         for x, y in tqdm(self.val_loader, desc="Validation"):
             x = x.to(self.device)
@@ -145,34 +160,34 @@ class TapeIdentificationTrainer:
 
             e_x = self.encoder(x)
             e_y = self.encoder(y)
-            p = self.controller(e_x, e_y)
-            y_pred = self.processor(x, p)
+            logits = self.controller(e_x, e_y)
+            y_pred = self.processor(x, logits, use_argmax=False)
 
             loss = self.loss_fn(y_pred.squeeze(1), y.squeeze(1))
             total_loss += loss.item()
 
             # Acumular predicciones para estadísticas
-            depth_pred = 1.0 + p * 9.0
-            all_depth_preds.append(depth_pred.cpu())
+            gain_pred = self.processor.get_gain_from_logits(logits, use_argmax=False)
+            all_gain_preds.append(gain_pred.cpu())
 
         # Calcular estadísticas de validación
-        all_depth_preds = torch.cat(all_depth_preds, dim=0)
+        all_gain_preds = torch.cat(all_gain_preds, dim=0)
         avg_loss = total_loss / len(self.val_loader)
 
         # TensorBoard logging
         self.writer.add_scalar("val/loss", avg_loss, self.current_epoch)
-        self.writer.add_scalar("val/depth_mean", all_depth_preds.mean().item(), self.current_epoch)
-        self.writer.add_scalar("val/depth_std", all_depth_preds.std().item(), self.current_epoch)
-        self.writer.add_scalar("val/depth_min", all_depth_preds.min().item(), self.current_epoch)
-        self.writer.add_scalar("val/depth_max", all_depth_preds.max().item(), self.current_epoch)
+        self.writer.add_scalar("val/gain_mean", all_gain_preds.mean().item(), self.current_epoch)
+        self.writer.add_scalar("val/gain_std", all_gain_preds.std().item(), self.current_epoch)
+        self.writer.add_scalar("val/gain_min", all_gain_preds.min().item(), self.current_epoch)
+        self.writer.add_scalar("val/gain_max", all_gain_preds.max().item(), self.current_epoch)
 
         # Loggear histograma de predicciones (comentado por incompatibilidad numpy/tensorboard)
-        # self.writer.add_histogram("val/depth_distribution", all_depth_preds.flatten().numpy(), self.current_epoch)
+        # self.writer.add_histogram("val/gain_distribution", all_gain_preds.flatten().numpy(), self.current_epoch)
 
         return avg_loss
 
-    def save_checkpoint(self, is_best: bool = False, emergency: bool = False):
-        """Guarda checkpoint (solo last y best para ahorrar espacio)."""
+    def save_checkpoint(self, is_best: bool = False, is_last: bool = False, emergency: bool = False):
+        """Guarda checkpoint (solo best, last o emergency)."""
         checkpoint = {
             "epoch": self.current_epoch,
             "encoder_state": self.encoder.state_dict(),
@@ -183,20 +198,20 @@ class TapeIdentificationTrainer:
             "global_step": self.global_step,
         }
 
-        # Guardar último checkpoint (siempre sobrescribe)
         if emergency:
-            last_path = self.output_dir / f"checkpoint_epoch{self.current_epoch}_emergency.pt"
-            logging.warning(f"Saving emergency checkpoint to {last_path}")
-        else:
-            last_path = self.output_dir / "last_checkpoint.pt"
+            path = self.output_dir / f"checkpoint_epoch{self.current_epoch}_emergency.pt"
+            torch.save(checkpoint, path)
+            logging.warning(f"Saved emergency checkpoint to {path}")
 
-        torch.save(checkpoint, last_path)
-
-        # Guardar mejor
         if is_best:
-            best_path = self.output_dir / "best_model.pt"
-            torch.save(checkpoint, best_path)
-            print(f"✓ Saved best model (val_loss={self.best_val_loss:.4f})")
+            path = self.output_dir / "best_model.pt"
+            torch.save(checkpoint, path)
+            print(f"✓ Saved best model (epoch {self.current_epoch}, val_loss={self.best_val_loss:.4f})")
+
+        if is_last:
+            path = self.output_dir / "last_model.pt"
+            torch.save(checkpoint, path)
+            print(f"✓ Saved last model (epoch {self.current_epoch})")
 
     def load_checkpoint(self, checkpoint_path: str):
         """Carga checkpoint para continuar entrenamiento."""
@@ -251,12 +266,17 @@ class TapeIdentificationTrainer:
                         f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
                     )
 
-                    # Guardar checkpoint
-                    is_best = val_loss < self.best_val_loss
-                    if is_best:
-                        self.best_val_loss = val_loss
+                    # Learning rate scheduling
+                    if self.scheduler:
+                        self.scheduler.step(val_loss)
 
-                    self.save_checkpoint(is_best=is_best)
+                    # Check for best model (no early stopping)
+                    if val_loss < self.best_val_loss - self.min_delta:
+                        self.best_val_loss = val_loss
+                        self.save_checkpoint(is_best=True)
+                        print(f"✓ New best model! val_loss={val_loss:.4f}")
+                    else:
+                        print(f"No improvement (best: {self.best_val_loss:.4f})")
 
                 except Exception as e:
                     logging.error(f"Error in epoch {epoch}: {str(e)}")
@@ -280,6 +300,9 @@ class TapeIdentificationTrainer:
             raise
 
         finally:
+            # Guardar último modelo
+            self.save_checkpoint(is_last=True)
+
             print("\nTraining finished!")
             print(f"Best validation loss: {self.best_val_loss:.4f}")
             print(f"\nTo view training logs, run:")
