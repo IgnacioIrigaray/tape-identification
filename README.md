@@ -19,15 +19,15 @@ This project implements a neural network that learns to predict the saturation d
 ## Installation
 
 ### Requirements
-- Python 3.8+
-- PyTorch 1.9+
+- Python 3.9
+- PyTorch 1.9
 - CUDA (optional, for GPU training)
 
 ### Setup
 
 ```bash
 # Clone repository
-git clone https://github.com/YOUR_USERNAME/tape-identification.git
+git clone https://github.com/IgnacioIrigaray/tape-identification.git
 cd tape-identification
 
 # Create virtual environment

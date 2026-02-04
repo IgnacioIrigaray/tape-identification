@@ -1,6 +1,6 @@
 # Core dependencies
-torch>=2.0.0
-torchaudio>=2.0.0
+torch==2.8.0
+torchaudio==2.8.0
 torchvision>=0.15.0
 
 # Audio processing
