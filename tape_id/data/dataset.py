@@ -297,4 +297,4 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         x = utils.linear_fade(x, sample_rate=self.sample_rate)
         y = utils.linear_fade(y, sample_rate=self.sample_rate)
 
-        return x, y
+        return x, y, torch.tensor(param)

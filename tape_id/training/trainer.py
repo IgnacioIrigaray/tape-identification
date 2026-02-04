@@ -25,6 +25,7 @@ class TapeIdentificationTrainer:
         val_loader: Validation dataloader
         loss_fn: Loss function
         optimizer: Optimizer
+        l1_weight: Weight for the L1 regularization loss for model parameters
         device: Device (cuda/cpu)
         output_dir: Directorio para guardar checkpoints
         log_dir: Directorio para logs de TensorBoard
@@ -39,6 +40,8 @@ class TapeIdentificationTrainer:
         val_loader: DataLoader,
         loss_fn: nn.Module,
         optimizer: torch.optim.Optimizer,
+        params_reg_weight: float = 0.1,
+        params_reg_loss=None,
         scheduler=None,
         device: str = "cuda",
         output_dir: str = "outputs/checkpoints",
@@ -51,6 +54,8 @@ class TapeIdentificationTrainer:
         self.val_loader = val_loader
         self.loss_fn = loss_fn.to(device)
         self.optimizer = optimizer
+        self.params_reg_weight = params_reg_weight
+        self.params_reg_loss = params_reg_loss if params_reg_loss else nn.L1Loss()
         self.scheduler = scheduler
         self.device = device
         self.output_dir = Path(output_dir)
@@ -90,7 +95,7 @@ class TapeIdentificationTrainer:
         total_loss = 0.0
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
 
-        for batch_idx, (x, y) in enumerate(pbar):
+        for batch_idx, (x, y, params) in enumerate(pbar):
             # Mover a device (el dataset ya retorna [batch, 1, samples])
             x = x.to(self.device)
             y = y.to(self.device)
@@ -107,7 +112,11 @@ class TapeIdentificationTrainer:
             y_pred = self.processor(x, logits, use_argmax=False)
 
             # 4. Calcular loss
-            loss = self.loss_fn(y_pred.squeeze(1), y.squeeze(1))
+            if self.params_reg_weight > 0 and params is not None:
+                
+                loss_params = self.params_reg_loss(logits, params.to(self.device))
+
+            loss = self.loss_fn(y_pred.squeeze(1), y.squeeze(1)) + self.params_reg_weight * loss_params
 
             # Backward
             self.optimizer.zero_grad()
@@ -136,7 +145,7 @@ class TapeIdentificationTrainer:
             self.writer.add_scalar("train/gain_max", gain_pred.max().item(), self.global_step)
 
             # Loggear learning rate
-            current_lr = self.optimizer.param_groups[0]['lr']
+            current_lr = self.optimizer.params_groups[0]['lr']
             self.writer.add_scalar("train/learning_rate", current_lr, self.global_step)
 
             self.global_step += 1
