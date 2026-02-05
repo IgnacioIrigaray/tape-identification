@@ -81,6 +81,7 @@ def main():
         input_dirs=config["input_dirs"],
         ext=config["ext"],
         subset="val",
+        train_frac=config["train_frac"],
         length=config["audio_length"],
         min_param=config["min_gain"],
         max_param=config["max_gain"],
