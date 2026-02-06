@@ -120,9 +120,9 @@ class TapeIdentificationTrainer:
 
             loss_signal = self.loss_fn(y_pred.squeeze(1), y.squeeze(1)) 
 
+            gain_values = self.gain_values.to(params.device)
+
             if self.params_reg_weight > 0 and params is not None:
-                # Convert params (float gain) to class indices based on gain_values
-                gain_values = self.processor.gain_values.to(params.device)
                 # params: [batch] or [batch, 1] (float gain)
                 # Find closest gain value index for each param
                 target_class = torch.argmin(torch.abs(gain_values.unsqueeze(0) - params.unsqueeze(1)), dim=1).unsqueeze(1)
@@ -131,8 +131,7 @@ class TapeIdentificationTrainer:
                 loss = loss_signal + self.params_reg_weight * loss_params
             
             else:
-                loss = loss_signal
-                
+                loss = loss_signal 
 
             # Backward
             self.optimizer.zero_grad()
@@ -150,12 +149,13 @@ class TapeIdentificationTrainer:
 
             total_loss += loss.item()
             total_loss_signal += loss_signal.item()
-            total_loss_params += loss_params.item() if (self.params_reg_weight > 0 and params is not None) else 0.0
 
             # TensorBoard logging
             self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
-            self.writer.add_scalar("train/signal_loss_step", loss.item(), self.global_step)
-            self.writer.add_scalar("train/params_loss_step", loss_params.item(), self.global_step)
+            self.writer.add_scalar("train/signal_loss_step", loss_signal.item(), self.global_step)
+            if (self.params_reg_weight > 0 and params is not None):
+                total_loss_params += loss_params.item()
+                self.writer.add_scalar("train/params_loss_step", loss_params.item(), self.global_step)
 
             # Loggear estadísticas de gain predicho (expected value)
             gain_pred = self.processor.get_gain_from_logits(logits, use_argmax=False)
@@ -191,37 +191,41 @@ class TapeIdentificationTrainer:
             x = x.to(self.device)
             y = y.to(self.device)
             params = params.to(self.device)
+            gain_values = self.processor.gain_values.to(params.device)
 
             e_x = self.encoder(x)
             e_y = self.encoder(y)
             logits = self.controller(e_x, e_y)
             y_pred = self.processor(x, logits, use_argmax=False)
+            gain_values = self.gain_values.to(params.device)
 
+            target_class = torch.argmin(torch.abs(gain_values.unsqueeze(0) - params.unsqueeze(1)), dim=1).unsqueeze(1)
             loss = self.loss_fn(y_pred.squeeze(1), y.squeeze(1))
 
             # Categorical parameter loss
             if self.params_reg_weight > 0 and params is not None:
-                gain_values = self.processor.gain_values.to(params.device)
-                target_class = torch.argmin(torch.abs(gain_values.unsqueeze(0) - params.unsqueeze(1)), dim=1).unsqueeze(1)
                 loss_params = self.params_reg_type(logits, target_class.unsqueeze(1))
                 loss += self.params_reg_weight * loss_params
-
-                # Métrica de accuracy para clasificación categórica
-                pred_class = torch.argmax(logits, dim=1, keepdim=True)
-                correct_params += (pred_class == target_class).sum().item()
-                total_params += target_class.size(0)
-
+                total_loss_params += loss_params.item() 
+      
             total_loss += loss.item()
-            total_loss_params += loss_params.item() if (self.params_reg_weight > 0 and params is not None) else 0.0
 
             # Acumular predicciones para estadísticas
             gain_pred = self.processor.get_gain_from_logits(logits, use_argmax=False)
             all_gain_preds.append(gain_pred.cpu())
 
+            # Métrica de accuracy para clasificación categórica
+            pred_class = torch.argmax(logits, dim=1, keepdim=True)
+            correct_params += (pred_class == target_class).sum().item()
+            total_params += target_class.size(0)
+
         # Calcular estadísticas de validación
         all_gain_preds = torch.cat(all_gain_preds, dim=0)
         avg_loss = total_loss / len(self.val_loader)
-        avg_loss_params = total_loss_params / len(self.val_loader)
+        if self.params_reg_weight > 0 and params is not None:
+            avg_loss_params = total_loss_params / len(self.val_loader)
+        else:
+            avg_loss_params = 0.0
 
         # Calcular accuracy de clasificación de parámetros
         params_acc = correct_params / total_params if total_params > 0 else 0.0
@@ -230,7 +234,7 @@ class TapeIdentificationTrainer:
 
         # TensorBoard logging
         self.writer.add_scalar("val/loss", avg_loss, self.current_epoch)
-        self.writer.add_scalar("val/params_loss", avg_loss, self.current_epoch)
+        self.writer.add_scalar("val/params_loss", avg_loss_params, self.current_epoch)
         self.writer.add_scalar("val/gain_mean", all_gain_preds.mean().item(), self.current_epoch)
         self.writer.add_scalar("val/gain_std", all_gain_preds.std().item(), self.current_epoch)
         self.writer.add_scalar("val/gain_min", all_gain_preds.min().item(), self.current_epoch)
@@ -308,7 +312,8 @@ class TapeIdentificationTrainer:
                     train_loss, train_params_loss = self.train_epoch()
 
                     # Validate
-                    val_loss, val_params_loss = self.validate()
+                    with torch.no_grad():
+                        val_loss, val_params_loss = self.validate()
 
                     # Loggear métricas por época
                     self.writer.add_scalar("train/loss_epoch", train_loss, epoch)

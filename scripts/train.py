@@ -34,10 +34,12 @@ def main():
         "val_examples_per_epoch": 500,
         "buffer_size_gb": 0.2,  # Reducido de 0.5 para menor uso de memoria
         "buffer_reload_rate": 2000,
+        "train_frac": 0.8,
 
         # Modelo
         "embed_dim": 1024,
         "hidden_dim": 256,
+        "params_reg_weight": 0, # peso de regularizacion basada en params
         "min_gain": 1.0,  # Hard clipping: gain=1 es bypass
         "max_gain": 4.0,  # gain=4 es clipping severo
         "num_classes": 3,
@@ -65,6 +67,7 @@ def main():
         input_dirs=config["input_dirs"],
         ext=config["ext"],
         subset="train",
+        train_frac=config["train_frac"],
         length=config["audio_length"],
         min_param=config["min_gain"],
         max_param=config["max_gain"],
@@ -174,6 +177,7 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         loss_fn=loss_fn,
+        params_reg_weight=config["params_reg_weight"],
         optimizer=optimizer,
         scheduler=scheduler,
         device=config["device"],
