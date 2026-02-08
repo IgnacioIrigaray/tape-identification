@@ -26,7 +26,7 @@ def main():
         # Datos
         "audio_dir": "/mnt/data/working_datasets/jamendo",
         "input_dirs": ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09"],
-        "ext": "mp3",
+        "ext": "wav",
         "batch_size": 8,  # Reducido de 16 para menor uso de memoria
         "num_workers": 0,
         "audio_length": 65536,
