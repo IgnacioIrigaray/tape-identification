@@ -171,7 +171,7 @@ class TapeIdentificationTrainer:
             self.global_step += 1
             pbar.set_postfix({"loss": loss.item(), "gain_mean": gain_pred.mean().item()})
 
-        return total_loss / len(self.train_loader), total_loss_params / len(self.train_loader)
+        return total_loss / len(self.train_loader), total_loss_signal / len(self.train_loader), total_loss_params / len(self.train_loader)
 
     @torch.no_grad()
     def validate(self) -> float:
@@ -200,14 +200,18 @@ class TapeIdentificationTrainer:
             gain_values = self.gain_values.to(params.device)
 
             target_class = torch.argmin(torch.abs(gain_values.unsqueeze(0) - params.unsqueeze(1)), dim=1).unsqueeze(1)
-            loss = self.loss_fn(y_pred.squeeze(1), y.squeeze(1))
+            loss_signal = self.loss_fn(y_pred.squeeze(1), y.squeeze(1))
+            total_loss_signal += loss_signal.item()
 
             # Categorical parameter loss
             if self.params_reg_weight > 0 and params is not None:
                 loss_params = self.params_reg_type(logits, target_class.unsqueeze(1))
-                loss += self.params_reg_weight * loss_params
+                loss = loss_signal + self.params_reg_weight * loss_params
                 total_loss_params += loss_params.item() 
       
+            else:
+                loss = loss_signal
+
             total_loss += loss.item()
 
             # Acumular predicciones para estadísticas
@@ -222,6 +226,7 @@ class TapeIdentificationTrainer:
         # Calcular estadísticas de validación
         all_gain_preds = torch.cat(all_gain_preds, dim=0)
         avg_loss = total_loss / len(self.val_loader)
+        avg_signal_loss = total_loss_signal / len(self.val_loader)
         if self.params_reg_weight > 0 and params is not None:
             avg_loss_params = total_loss_params / len(self.val_loader)
         else:
@@ -243,7 +248,7 @@ class TapeIdentificationTrainer:
         # Loggear histograma de predicciones (comentado por incompatibilidad numpy/tensorboard)
         # self.writer.add_histogram("val/gain_distribution", all_gain_preds.flatten().numpy(), self.current_epoch)
 
-        return avg_loss, avg_loss_params
+        return avg_loss, avg_signal_loss, avg_loss_params
 
     def save_checkpoint(self, is_best: bool = False, is_last: bool = False, emergency: bool = False):
         """Guarda checkpoint (solo best, last o emergency)."""
@@ -297,6 +302,8 @@ class TapeIdentificationTrainer:
         print(f"Val batches: {len(self.val_loader)}")
         print(f"TensorBoard logs: {self.log_dir}")
 
+        self.writer.add_scalar("train/param_reg_weight", self.params_reg_weight, 0)
+
         # Cargar checkpoint si se especifica
         start_epoch = 0
         if resume_from:
@@ -309,21 +316,27 @@ class TapeIdentificationTrainer:
 
                 try:
                     # Train
-                    train_loss, train_params_loss = self.train_epoch()
+                    train_loss, train_signal_loss, train_params_loss = self.train_epoch()
 
                     # Validate
                     with torch.no_grad():
-                        val_loss, val_params_loss = self.validate()
+                        val_loss, val_signal_loss, val_params_loss = self.validate()
 
                     # Loggear métricas por época
                     self.writer.add_scalar("train/loss_epoch", train_loss, epoch)
-                    self.writer.add_scalars("loss_comparison", {
+                    self.writer.add_scalars("main/loss_comparison", {
                         "train": train_loss,
                         "val": val_loss,
                     }, epoch)
 
+                    self.writer.add_scalar("train/signal_loss_epoch", train_signal_loss, epoch)
+                    self.writer.add_scalars("main/signal_loss_comparison", {
+                        "train": train_signal_loss,
+                        "val": val_signal_loss,
+                    }, epoch)
+
                     self.writer.add_scalar("train/params_loss_epoch", train_params_loss, epoch)
-                    self.writer.add_scalars("params_loss_comparison", {
+                    self.writer.add_scalars("main/params_loss_comparison", {
                         "train": train_params_loss,
                         "val": val_params_loss,
                     }, epoch)
@@ -336,13 +349,21 @@ class TapeIdentificationTrainer:
                     if self.scheduler:
                         self.scheduler.step(val_loss)
 
-                    # Check for best model (no early stopping)
+                    # Early stopping logic
                     if val_loss < self.best_val_loss - self.min_delta:
                         self.best_val_loss = val_loss
                         self.save_checkpoint(is_best=True)
                         print(f"✓ New best model! val_loss={val_loss:.4f}")
+                        self.patience_counter = 0
                     else:
-                        print(f"No improvement (best: {self.best_val_loss:.4f})")
+                        self.patience_counter += 1
+                        print(f"No improvement (best: {self.best_val_loss:.4f}), patience: {self.patience_counter}/{self.patience}")
+                        if self.patience_counter >= self.patience:
+                            md_text = f"""
+                                        ## Early stopping executed at epoch {self.current_epoch}
+                                        """
+                            self.writer.add_text('train/warnings', md_text, self.current_epoch)
+                            break
 
                 except Exception as e:
                     logging.error(f"Error in epoch {epoch}: {str(e)}")
