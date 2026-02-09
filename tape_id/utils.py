@@ -31,38 +31,25 @@ def count_parameters(model, trainable_only=True):
     return params
 
 
-def model_summary(encoder, controller, processor):
+def model_summary(encoder, controller):
     """
     Imprime resumen de parámetros del modelo.
 
     Args:
         encoder: Encoder model
         controller: Controller model
-        processor: Processor model
     """
     encoder_params = count_parameters(encoder)
     controller_params = count_parameters(controller)
-    processor_params = count_parameters(processor)
-    total_params = encoder_params + controller_params + processor_params
+    total_params = encoder_params + controller_params
 
     print("\n" + "=" * 60)
     print("MODEL SUMMARY")
     print("=" * 60)
     print(f"Encoder:     {encoder_params/1e6:>8.2f} M parameters")
     print(f"Controller:  {controller_params/1e6:>8.2f} M parameters")
-    print(f"Processor:   {processor_params/1e6:>8.2f} M parameters")
     print("-" * 60)
     print(f"Total:       {total_params/1e6:>8.2f} M parameters")
-
-    # Non-trainable params
-    encoder_nt = count_parameters(encoder, trainable_only=False) - encoder_params
-    controller_nt = count_parameters(controller, trainable_only=False) - controller_params
-    processor_nt = count_parameters(processor, trainable_only=False) - processor_params
-    total_nt = encoder_nt + controller_nt + processor_nt
-
-    if total_nt > 0:
-        print(f"Non-trainable: {total_nt/1e6:>6.2f} M parameters")
-
     print("=" * 60 + "\n")
 
 
@@ -124,10 +111,10 @@ def conform_length(x: torch.Tensor, length: int):
 def linear_fade(
     x: torch.Tensor,
     fade_ms: float = 50.0,
-    sample_rate: float = 22050,
+    sample_rate: int = 22050,
 ):
     """Apply fade in and fade out to last dim."""
-    fade_samples = int(fade_ms * 1e-3 * 22050)
+    fade_samples = int(fade_ms * 1e-3 * sample_rate)
 
     fade_in = torch.linspace(0.0, 1.0, steps=fade_samples)
     fade_out = torch.linspace(1.0, 0.0, steps=fade_samples)

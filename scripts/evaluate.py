@@ -1,5 +1,9 @@
 """
-Script de evaluación para modelo entrenado.
+Script de evaluación sobre el split de test.
+
+Usa la misma lógica de split determinista que el dataset (seed=42, train_frac=0.8)
+para obtener el 10% de archivos de test, aplica saturación con cada clase de gain,
+y evalúa el modelo.
 """
 
 import sys
@@ -7,133 +11,157 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import os
+import glob
+import random
 import torch
 import torchaudio
 import argparse
+import numpy as np
+from tqdm import tqdm
 
 from tape_id.models.encoder import SpectralEncoder
 from tape_id.models.controller import ParameterController
-from tape_id.models.tape_processor import HardClippingProcessor, apply_hard_clipping
+from tape_id.data.dataset import hard_clipping
+from tape_id.utils import split_dataset, conform_length, linear_fade
 
 
-def load_model(checkpoint_path: str, device: str = "cuda", num_classes: int = 3):
+def load_model(checkpoint_path: str, device: str = "cpu", num_classes: int = 3, sample_rate: int = 22050):
     """Carga modelo desde checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    encoder = SpectralEncoder(num_params=1, sample_rate=24000, embed_dim=1024, width_mult=2).to(device)
+    encoder = SpectralEncoder(num_params=1, sample_rate=sample_rate, embed_dim=1024, width_mult=2).to(device)
     controller = ParameterController(num_classes=num_classes, embed_dim=1024, hidden_dim=256).to(device)
-    processor = HardClippingProcessor(min_gain=1.0, max_gain=4.0, num_classes=num_classes).to(device)
 
     encoder.load_state_dict(checkpoint["encoder_state"])
     controller.load_state_dict(checkpoint["controller_state"])
-    processor.load_state_dict(checkpoint["processor_state"])
 
     encoder.eval()
     controller.eval()
-    processor.eval()
 
-    return encoder, controller, processor
+    return encoder, controller, checkpoint.get("epoch", "?")
 
 
-@torch.no_grad()
-def estimate_parameter(
-    audio: torch.Tensor,
-    audio_saturated: torch.Tensor,
-    encoder,
-    controller,
-    processor,
-    device: str,
-) -> float:
-    """
-    Estima el parámetro de saturación.
+def get_test_files(audio_dir, input_dirs, ext="mp3", train_frac=0.8):
+    """Obtiene los archivos del split de test usando la misma lógica que el dataset."""
+    filepaths = []
+    for input_dir in input_dirs:
+        search_path = os.path.join(audio_dir, input_dir, f"*.{ext}")
+        filepaths += glob.glob(search_path)
+    filepaths = sorted(filepaths)
 
-    Args:
-        audio: Audio limpio [samples]
-        audio_saturated: Audio saturado [samples]
-        encoder: Encoder model
-        controller: Controller model
-        processor: Processor model
-        device: Device
+    if len(filepaths) == 0:
+        search_path = os.path.join(audio_dir, f"*.{ext}")
+        filepaths = sorted(glob.glob(search_path))
 
-    Returns:
-        Parámetro estimado
-    """
-    x = audio.unsqueeze(0).unsqueeze(0).to(device)
-    y = audio_saturated.unsqueeze(0).unsqueeze(0).to(device)
-
-    e_x = encoder(x)
-    e_y = encoder(y)
-    logits = controller(e_x, e_y)
-    param = processor.get_gain_from_logits(logits, use_argmax=True)
-
-    return param[0].item()
+    # Mismo shuffle determinista que dataset.py
+    rng_split = random.Random(42)
+    rng_split.shuffle(filepaths)
+    return split_dataset(filepaths, "test", train_frac)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate tape identification model")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
-    parser.add_argument("--audio", type=str, help="Path to audio file (optional)")
-    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
-    parser.add_argument("--num_classes", type=int, default=3, help="Number of discrete classes")
+    parser = argparse.ArgumentParser(description="Evaluate on test split")
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--audio_dir", type=str, default="/mnt/data/working_datasets/jamendo")
+    parser.add_argument("--input_dirs", nargs="+", default=["00", "01", "02", "03", "04", "05", "06", "07", "08", "09"])
+    parser.add_argument("--ext", type=str, default="mp3")
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--num_classes", type=int, default=3)
+    parser.add_argument("--min_gain", type=float, default=1.0)
+    parser.add_argument("--max_gain", type=float, default=10.0)
+    parser.add_argument("--sample_rate", type=int, default=22050)
+    parser.add_argument("--max_files", type=int, default=0, help="Max test files (0=all)")
+    parser.add_argument("--audio_length", type=int, default=65536, help="Audio length in samples (must match training)")
     args = parser.parse_args()
 
-    device = args.device if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    device = args.device
+    print(f"Device: {device}")
 
-    print(f"Loading model from {args.checkpoint}...")
-    encoder, controller, processor = load_model(args.checkpoint, device, args.num_classes)
-    print(f"Model loaded successfully! (num_classes={args.num_classes})")
-    print(f"gain_values: {processor.gain_values.tolist()}")
+    # Cargar modelo
+    encoder, controller, epoch = load_model(args.checkpoint, device, args.num_classes, args.sample_rate)
+    print(f"Model loaded (epoch {epoch})")
 
-    if args.audio is None:
-        print("\nGenerating synthetic audio for testing...")
-        sr = 24000
-        duration = 3.0
-        t = torch.linspace(0, duration, int(sr * duration))
-        audio = torch.sin(2 * 3.14159 * 220 * t)
-        audio += 0.5 * torch.sin(2 * 3.14159 * 440 * t)
-        audio = audio / audio.abs().max()
-    else:
-        print(f"\nLoading audio from {args.audio}...")
-        audio, sr = torchaudio.load(args.audio)
-        if sr != 24000:
-            resampler = torchaudio.transforms.Resample(sr, 24000)
-            audio = resampler(audio)
+    # Gain values (geomspace, igual que dataset)
+    gain_values = torch.tensor(np.geomspace(args.min_gain, args.max_gain, args.num_classes), dtype=torch.float32)
+    gain_labels = [f"{g:.2f}" for g in gain_values.tolist()]
+    print(f"Gain values: {gain_values.tolist()}")
+
+    # Obtener archivos de test
+    test_files = get_test_files(args.audio_dir, args.input_dirs, args.ext)
+    print(f"Test split: {len(test_files)} files")
+
+    if args.max_files > 0 and len(test_files) > args.max_files:
+        test_files = test_files[:args.max_files]
+        print(f"Using first {args.max_files} files")
+
+    # Evaluar
+    num_classes = args.num_classes
+    confusion = np.zeros((num_classes, num_classes), dtype=int)
+    correct = 0
+    total = 0
+
+    sample_rate = args.sample_rate
+    audio_length = args.audio_length
+
+    pbar = tqdm(test_files, ncols=80)
+    for fpath in pbar:
+        audio, sr = torchaudio.load(fpath)
+        if sr != sample_rate:
+            audio = torchaudio.transforms.Resample(sr, sample_rate)(audio)
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0)
         else:
             audio = audio.squeeze(0)
-        audio = audio / audio.abs().max()
 
-    max_samples = 24000 * 3
-    if audio.shape[0] > max_samples:
-        audio = audio[:max_samples]
+        # Recortar a audio_length (mismo que training)
+        if audio.shape[0] > audio_length:
+            audio = audio[:audio_length]
 
-    print(f"Audio shape: {audio.shape}")
+        audio = audio / (audio.abs().max() + 1e-8)
 
-    # Test con los valores de gain del procesador
-    test_params = processor.gain_values.tolist()
+        # Sortear una clase al azar
+        class_idx = random.randint(0, num_classes - 1)
+        gain = gain_values[class_idx].item()
+        x = audio.unsqueeze(0)
+        audio_sat = hard_clipping(x, gain)
+        audio_sat = conform_length(audio_sat, audio_length)
+        audio_sat = linear_fade(audio_sat, sample_rate=sample_rate)
 
-    print("\n" + "=" * 60)
-    print("PARAMETER ESTIMATION TEST (Hard Clipping)")
+        y = audio_sat.unsqueeze(0).to(device)
+        with torch.no_grad():
+            e_y = encoder(y)
+            logits = controller(e_y)
+            pred_idx = torch.argmax(logits, dim=-1).item()
+
+        if pred_idx == class_idx:
+            correct += 1
+        total += 1
+        confusion[class_idx][pred_idx] += 1
+
+        accuracy_so_far = 100 * correct / total if total > 0 else 0
+        pbar.set_postfix(acc=f"{accuracy_so_far:.1f}%")
+
+    # Resultados
+    accuracy = 100 * correct / total if total > 0 else 0
     print("=" * 60)
-    print(f"{'Real gain':>12} | {'Estimated':>12} | {'Error':>10}")
-    print("-" * 60)
+    print(f"Accuracy: {correct}/{total} = {accuracy:.1f}%")
 
-    errors = []
+    # Accuracy por clase
+    print(f"\nPer-class accuracy:")
+    for i in range(num_classes):
+        class_total = confusion[i].sum()
+        class_correct = confusion[i][i]
+        class_acc = 100 * class_correct / class_total if class_total > 0 else 0
+        print(f"  gain={gain_labels[i]:>6}: {class_correct}/{class_total} = {class_acc:.1f}%")
 
-    for real_param in test_params:
-        audio_sat = apply_hard_clipping(audio, real_param)
-        estimated = estimate_parameter(audio, audio_sat, encoder, controller, processor, device)
-
-        error = abs(real_param - estimated)
-        errors.append(error)
-
-        print(f"{real_param:>12.3f} | {estimated:>12.3f} | {error:>10.4f}")
-
-    print("-" * 60)
-    print(f"Average error: {sum(errors) / len(errors):.4f}")
-    print(f"Max error: {max(errors):.4f}")
+    # Matriz de confusión
+    print(f"\nConfusion matrix (rows=real, cols=predicted):")
+    header = "".join(f"{gain_labels[i]:>10}" for i in range(num_classes))
+    print(f"{'':>10}{header}")
+    for i in range(num_classes):
+        row = "".join(f"{confusion[i][j]:>10d}" for j in range(num_classes))
+        print(f"{'g=' + gain_labels[i]:>10}{row}")
 
 
 if __name__ == "__main__":

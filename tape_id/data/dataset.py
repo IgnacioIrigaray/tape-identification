@@ -115,6 +115,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         saturation_model: str = "ja",
         log_scale: bool = True,
         ext: str = "mp3",
+        sample_rate: int = None,
         # Aliases para compatibilidad
         min_gain: float = None,
         max_gain: float = None,
@@ -143,10 +144,11 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
 
         self.min_param = min_param
         self.max_param = max_param
+        self.target_sample_rate = sample_rate
 
         # Generar valores discretos de parámetro para las N clases
         import numpy as np
-        if log_scale and saturation_model == "ja":
+        if log_scale:
             self.param_values = list(np.geomspace(min_param, max_param, num_classes))
         else:
             self.param_values = list(np.linspace(min_param, max_param, num_classes))
@@ -168,8 +170,9 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
             self.input_filepaths = glob.glob(search_path)
             self.input_filepaths = sorted(self.input_filepaths)
 
-        # Shuffle antes de split para evitar correlaciones de género/artista
-        random.shuffle(self.input_filepaths)
+        # Shuffle determinista antes de split para garantizar separación reproducible
+        rng_split = random.Random(42)
+        rng_split.shuffle(self.input_filepaths)
 
         # Split train/val
         self.input_filepaths = utils.split_dataset(
@@ -189,6 +192,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
                 input_filepath,
                 preload=False,
                 half=half,
+                target_sample_rate=self.target_sample_rate,
             )
             # Necesitamos al menos length samples
             if audio_file.num_frames < self.length:
@@ -212,19 +216,23 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
 
     def load_audio_buffer(self):
         """Carga un subconjunto de archivos en RAM."""
+        # Descargar archivos del buffer anterior para liberar RAM
+        for file_id in self.input_files_loaded:
+            af = self.input_files[file_id]
+            af.audio = None
+            af.loaded = False
+
         self.input_files_loaded = {}
         self.items_since_load = 0
         nbytes_loaded = 0
         max_bytes = self.buffer_size_gb * 1e9
 
-        # Shuffle files
         filepaths = list(self.input_files.keys())
         random.shuffle(filepaths)
 
         for file_id in filepaths:
             audio_file = self.input_files[file_id]
 
-            # Cargar si no está cargado
             if not audio_file.loaded:
                 audio_file.load()
 
@@ -240,33 +248,39 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         """Retorna un file_id aleatorio del buffer."""
         return random.choice(list(self.input_files_loaded.keys()))
 
-    def get_random_patch(self, audio_file, length):
+    def get_random_patch(self, audio_file, length, rng=None):
         """Obtiene índices aleatorios para un patch de audio."""
+        if rng is None:
+            rng = random
         max_start = audio_file.num_frames - length
         if max_start <= 0:
             return -1, -1
-        start_idx = random.randint(0, max_start)
+        start_idx = rng.randint(0, max_start)
         stop_idx = start_idx + length
         return start_idx, stop_idx
 
-    def __getitem__(self, _):
+    def __getitem__(self, idx):
         """
-        Genera un par (x, y) donde y = tape_saturation(x, random_gain).
+        Genera (y, class_idx) donde y = saturación(audio, param[class_idx]).
+        Para validación, usa seed determinista basado en idx.
         """
         # Recargar buffer si es necesario
         self.items_since_load += 1
         if self.items_since_load > self.buffer_reload_rate:
             self.load_audio_buffer()
 
+        rng = random
+
         # Obtener audio aleatorio
+        file_ids = list(self.input_files_loaded.keys())
         while True:
-            file_id = self.get_random_file_id()
+            file_id = rng.choice(file_ids)
             audio_file = self.input_files_loaded[file_id]
 
             if not audio_file.loaded:
                 audio_file.load()
 
-            start_idx, stop_idx = self.get_random_patch(audio_file, self.length)
+            start_idx, stop_idx = self.get_random_patch(audio_file, self.length, rng)
             if start_idx >= 0:
                 break
 
@@ -280,8 +294,9 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         # Normalizar a 0 dBFS (amplitud máxima = 1.0)
         x = x / (x.abs().max() + 1e-8)
 
-        # Seleccionar parámetro aleatorio de las N clases discretas
-        param = random.choice(self.param_values)
+        # Seleccionar clase aleatoria y obtener su parámetro
+        class_idx = rng.randint(0, self.num_classes - 1)
+        param = self.param_values[class_idx]
         if self.saturation_model == "ja":
             y = ja_saturation(x, param)
         elif self.saturation_model == "hard_clipping":
@@ -290,11 +305,9 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
             y = tape_saturation(x, param)
 
         # Conformar longitud
-        x = utils.conform_length(x, self.length)
         y = utils.conform_length(y, self.length)
 
         # Aplicar fade
-        x = utils.linear_fade(x, sample_rate=self.sample_rate)
         y = utils.linear_fade(y, sample_rate=self.sample_rate)
 
-        return x, y
+        return y, class_idx

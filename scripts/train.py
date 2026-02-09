@@ -13,9 +13,7 @@ from torch.utils.data import DataLoader
 
 from tape_id.models.encoder import SpectralEncoder
 from tape_id.models.controller import ParameterController
-from tape_id.models.tape_processor import HardClippingProcessor
 from tape_id.data.dataset import TapeSaturationDataset
-from tape_id.training.losses import MultiResolutionSTFTLoss
 from tape_id.training.trainer import TapeIdentificationTrainer
 from tape_id.utils import model_summary, seed_worker
 
@@ -27,27 +25,28 @@ def main():
         "audio_dir": "/mnt/data/working_datasets/jamendo",
         "input_dirs": ["00", "01", "02", "03", "04", "05", "06", "07", "08", "09"],
         "ext": "mp3",
-        "batch_size": 8,  # Reducido de 16 para menor uso de memoria
+        "batch_size": 32,
         "num_workers": 0,
+        "sample_rate": 22050,
         "audio_length": 65536,
         "train_examples_per_epoch": 5000,
         "val_examples_per_epoch": 500,
-        "buffer_size_gb": 0.2,  # Reducido de 0.5 para menor uso de memoria
+        "buffer_size_gb": 3.5,
         "buffer_reload_rate": 2000,
 
         # Modelo
         "embed_dim": 1024,
         "hidden_dim": 256,
-        "min_gain": 1.0,  # Hard clipping: gain=1 es bypass
-        "max_gain": 4.0,  # gain=4 es clipping severo
+        "min_gain": 1.0,
+        "max_gain": 10.0,
         "num_classes": 3,
         "saturation_model": "hard_clipping",
-        "log_scale": False,
+        "log_scale": True,
 
         # Training
-        "num_epochs": 100,
-        "learning_rate": 3e-4,
-        "device": "cuda",  # GPU no compatible con PyTorch actual (sm_86)
+        "num_epochs": 400,
+        "learning_rate": 5e-5,
+        "device": "cuda",
 
         # Output
         "output_dir": "outputs/checkpoints",
@@ -74,6 +73,7 @@ def main():
         num_examples_per_epoch=config["train_examples_per_epoch"],
         buffer_size_gb=config["buffer_size_gb"],
         buffer_reload_rate=config["buffer_reload_rate"],
+        sample_rate=config["sample_rate"],
     )
 
     val_dataset = TapeSaturationDataset(
@@ -90,6 +90,7 @@ def main():
         num_examples_per_epoch=config["val_examples_per_epoch"],
         buffer_size_gb=config["buffer_size_gb"],
         buffer_reload_rate=config["buffer_reload_rate"],
+        sample_rate=config["sample_rate"],
     )
 
     # Generator para reproducibilidad
@@ -123,9 +124,9 @@ def main():
     print("\nCreating models...")
     encoder = SpectralEncoder(
         num_params=1,
-        sample_rate=24000,
+        sample_rate=config["sample_rate"],
         embed_dim=config["embed_dim"],
-        width_mult=2,  # Igual que DeepAFx-ST
+        width_mult=2,
     )
 
     controller = ParameterController(
@@ -134,30 +135,21 @@ def main():
         hidden_dim=config["hidden_dim"],
     )
 
-    processor = HardClippingProcessor(
-        min_gain=config["min_gain"],
-        max_gain=config["max_gain"],
-        num_classes=config["num_classes"],
-    )
-
     # Mostrar resumen del modelo
-    model_summary(encoder, controller, processor)
+    model_summary(encoder, controller)
 
-    # Loss y optimizer
-    loss_fn = MultiResolutionSTFTLoss()
-
+    # Optimizer (solo encoder + controller)
     params = (
         list(encoder.parameters())
         + list(controller.parameters())
-        + list(processor.parameters())
     )
     optimizer = torch.optim.Adam(
         params,
         lr=config["learning_rate"],
-        weight_decay=1e-5  # L2 regularization para reducir overfitting
+        weight_decay=1e-5
     )
 
-    # Learning rate scheduler - reduce LR cuando validation se estanca
+    # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='min',
@@ -170,10 +162,8 @@ def main():
     trainer = TapeIdentificationTrainer(
         encoder=encoder,
         controller=controller,
-        processor=processor,
         train_loader=train_loader,
         val_loader=val_loader,
-        loss_fn=loss_fn,
         optimizer=optimizer,
         scheduler=scheduler,
         device=config["device"],

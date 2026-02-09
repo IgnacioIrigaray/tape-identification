@@ -6,7 +6,7 @@ import torchaudio
 
 
 class AudioFile(object):
-    def __init__(self, filepath, preload=False, half=False, target_loudness=None):
+    def __init__(self, filepath, preload=False, half=False, target_loudness=None, target_sample_rate=None):
         """Base class for audio files to handle metadata and loading.
 
         Args:
@@ -14,12 +14,14 @@ class AudioFile(object):
             preload (bool, optional): If set, load audio data into RAM. Default: False
             half (bool, optional): If set, store audio data as float16 to save space. Default: False
             target_loudness (float, optional): Loudness normalize to dB LUFS value. Default:
+            target_sample_rate (int, optional): Resample to this rate on load. Default: None (native)
         """
         super().__init__()
 
         self.filepath = filepath
         self.half = half
         self.target_loudness = target_loudness
+        self.target_sample_rate = target_sample_rate
         self.loaded = False
 
         if preload:
@@ -33,13 +35,25 @@ class AudioFile(object):
             num_frames = metadata.num_frames
             num_channels = metadata.num_channels
 
+            # Estimar num_frames después de resample
+            if target_sample_rate and self.sample_rate != target_sample_rate:
+                num_frames = int(num_frames * target_sample_rate / self.sample_rate)
+                self.sample_rate = target_sample_rate
+
         self.num_frames = num_frames
         self.num_channels = num_channels
 
     def load(self):
         audio, sr = torchaudio.load(self.filepath, normalize=True)
+
+        # Resample si es necesario
+        if self.target_sample_rate is not None and sr != self.target_sample_rate:
+            audio = torchaudio.transforms.Resample(sr, self.target_sample_rate)(audio)
+            sr = self.target_sample_rate
+
         self.audio = audio
         self.sample_rate = sr
+        self.num_frames = audio.shape[-1]
 
         if self.target_loudness is not None:
             warnings.warn("Loudness normalization not supported in simplified version. Skipping.")
