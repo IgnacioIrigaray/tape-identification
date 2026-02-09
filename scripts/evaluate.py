@@ -57,7 +57,8 @@ def get_test_files(audio_dir, input_dirs, ext="mp3", train_frac=0.8):
     # Mismo shuffle determinista que dataset.py
     rng_split = random.Random(42)
     rng_split.shuffle(filepaths)
-    return split_dataset(filepaths, "test", train_frac)
+    return split_dataset(filepaths, "test" \
+    "", train_frac)
 
 
 def main():
@@ -67,9 +68,10 @@ def main():
     parser.add_argument("--input_dirs", nargs="+", default=["00", "01", "02", "03", "04", "05", "06", "07", "08", "09"])
     parser.add_argument("--ext", type=str, default="mp3")
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--num_classes", type=int, default=3)
+    parser.add_argument("--num_classes", type=int, default=10)
     parser.add_argument("--min_gain", type=float, default=1.0)
     parser.add_argument("--max_gain", type=float, default=10.0)
+    parser.add_argument("--log_scale", action="store_true", help="Use log (geomspace) instead of linear")
     parser.add_argument("--sample_rate", type=int, default=22050)
     parser.add_argument("--max_files", type=int, default=0, help="Max test files (0=all)")
     parser.add_argument("--audio_length", type=int, default=65536, help="Audio length in samples (must match training)")
@@ -82,8 +84,11 @@ def main():
     encoder, controller, epoch = load_model(args.checkpoint, device, args.num_classes, args.sample_rate)
     print(f"Model loaded (epoch {epoch})")
 
-    # Gain values (geomspace, igual que dataset)
-    gain_values = torch.tensor(np.geomspace(args.min_gain, args.max_gain, args.num_classes), dtype=torch.float32)
+    # Gain values (linspace o geomspace, igual que dataset)
+    if args.log_scale:
+        gain_values = torch.tensor(np.geomspace(args.min_gain, args.max_gain, args.num_classes), dtype=torch.float32)
+    else:
+        gain_values = torch.tensor(np.linspace(args.min_gain, args.max_gain, args.num_classes), dtype=torch.float32)
     gain_labels = [f"{g:.2f}" for g in gain_values.tolist()]
     print(f"Gain values: {gain_values.tolist()}")
 

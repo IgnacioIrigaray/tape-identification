@@ -39,9 +39,9 @@ def main():
         "hidden_dim": 256,
         "min_gain": 1.0,
         "max_gain": 10.0,
-        "num_classes": 3,
+        "num_classes": 10,
         "saturation_model": "hard_clipping",
-        "log_scale": True,
+        "log_scale": False,
 
         # Training
         "num_epochs": 400,
