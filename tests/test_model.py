@@ -109,6 +109,42 @@ def test_full_pipeline():
     print("✓ Full pipeline OK")
 
 
+def test_wow_flutter_basic():
+    """Test wow_flutter function produces output of correct shape."""
+    print("Testing wow_flutter basic...")
+    from tape_id.data.dataset import wow_flutter
+    x = torch.randn(1, 22050)
+    x = x / (x.abs().max() + 1e-8)
+    y = wow_flutter(x, depth=0.5, sample_rate=22050)
+    assert y.shape == x.shape, f"Expected {x.shape}, got {y.shape}"
+    assert torch.isfinite(y).all(), "Output contains NaN or Inf"
+    print("✓ Wow/flutter basic OK")
+
+
+def test_wow_flutter_bypass():
+    """Test that depth~0 without OU is approximately bypass."""
+    print("Testing wow_flutter bypass (depth~0)...")
+    from tape_id.data.dataset import wow_flutter
+    x = torch.randn(1, 22050)
+    x = x / (x.abs().max() + 1e-8)
+    y = wow_flutter(x, depth=0.001, sample_rate=22050, enable_ou=False)
+    mse = ((x - y) ** 2).mean()
+    assert mse < 0.01, f"depth~0 should be near-bypass, but MSE={mse}"
+    print(f"✓ Wow/flutter bypass OK (MSE={mse:.6f})")
+
+
+def test_wow_flutter_lagrange3():
+    """Test Lagrange3 interpolation mode."""
+    print("Testing wow_flutter lagrange3...")
+    from tape_id.data.dataset import wow_flutter
+    x = torch.randn(1, 22050)
+    x = x / (x.abs().max() + 1e-8)
+    y = wow_flutter(x, depth=0.5, sample_rate=22050, interpolation="lagrange3", enable_ou=False)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+    print("✓ Wow/flutter lagrange3 OK")
+
+
 if __name__ == "__main__":
     print("Running tests...\n")
     test_encoder()
@@ -118,4 +154,7 @@ if __name__ == "__main__":
     test_hard_clipping_processor()
     test_hard_clipping_bypass()
     test_full_pipeline()
+    test_wow_flutter_basic()
+    test_wow_flutter_bypass()
+    test_wow_flutter_lagrange3()
     print("\n✅ All tests passed!")

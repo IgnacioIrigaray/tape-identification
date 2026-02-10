@@ -37,11 +37,18 @@ def main():
         # Modelo
         "embed_dim": 1024,
         "hidden_dim": 256,
-        "min_gain": 1.0,
-        "max_gain": 10.0,
-        "num_classes": 10,
-        "saturation_model": "hard_clipping",
+        "min_gain": 0.1,
+        "max_gain": 0.8,
+        "num_classes": 3,
+        "degradation_model": "wow_flutter",
         "log_scale": False,
+
+        # Wow/flutter
+        "wf_target_param": "rate",    # clasificar por rate (depth fijo)
+        "wf_fixed_depth": 0.5,        # depth fijo a 5 ms
+        "flutter_rate": 0.0,
+        "enable_ou": False,
+        "wf_interpolation": "linear",
 
         # Training
         "num_epochs": 400,
@@ -59,38 +66,37 @@ def main():
 
     # Crear datasets
     print("\nLoading datasets...")
-    train_dataset = TapeSaturationDataset(
+    dataset_kwargs = dict(
         audio_dir=config["audio_dir"],
         input_dirs=config["input_dirs"],
         ext=config["ext"],
-        subset="train",
         length=config["audio_length"],
         min_param=config["min_gain"],
         max_param=config["max_gain"],
         num_classes=config["num_classes"],
-        saturation_model=config["saturation_model"],
+        degradation_model=config["degradation_model"],
         log_scale=config["log_scale"],
-        num_examples_per_epoch=config["train_examples_per_epoch"],
         buffer_size_gb=config["buffer_size_gb"],
         buffer_reload_rate=config["buffer_reload_rate"],
         sample_rate=config["sample_rate"],
+        wow_rate=config.get("wow_rate", 0.4),
+        flutter_rate=config.get("flutter_rate", 0.5),
+        enable_ou=config.get("enable_ou", True),
+        wf_interpolation=config.get("wf_interpolation", "linear"),
+        wf_target_param=config.get("wf_target_param", "depth"),
+        wf_fixed_depth=config.get("wf_fixed_depth", 0.5),
+    )
+
+    train_dataset = TapeSaturationDataset(
+        subset="train",
+        num_examples_per_epoch=config["train_examples_per_epoch"],
+        **dataset_kwargs,
     )
 
     val_dataset = TapeSaturationDataset(
-        audio_dir=config["audio_dir"],
-        input_dirs=config["input_dirs"],
-        ext=config["ext"],
         subset="val",
-        length=config["audio_length"],
-        min_param=config["min_gain"],
-        max_param=config["max_gain"],
-        num_classes=config["num_classes"],
-        saturation_model=config["saturation_model"],
-        log_scale=config["log_scale"],
         num_examples_per_epoch=config["val_examples_per_epoch"],
-        buffer_size_gb=config["buffer_size_gb"],
-        buffer_reload_rate=config["buffer_reload_rate"],
-        sample_rate=config["sample_rate"],
+        **dataset_kwargs,
     )
 
     # Generator para reproducibilidad

@@ -10,8 +10,11 @@ El modelo aprende a predecir el gain que transforma x en y.
 
 import os
 import glob
+import math
 import torch
+import torchaudio
 import random
+import numpy as np
 from tqdm import tqdm
 from typing import List
 
@@ -75,6 +78,165 @@ def hard_clipping(x: torch.Tensor, gain: float) -> torch.Tensor:
     return torch.clamp(x * gain, -1.0, 1.0)
 
 
+# ---------------------------------------------------------------------------
+# Time-base distortion: Wow & Flutter
+# Adaptado de AnalogTapeModel (Jatin Chowdhury)
+# ---------------------------------------------------------------------------
+
+def _ornstein_uhlenbeck(num_samples: int, sample_rate: int,
+                        amount: float = 0.2, damping: float = 5.0,
+                        mean: float = 0.0) -> torch.Tensor:
+    """Proceso Ornstein-Uhlenbeck: random walk con mean-reversion + lowpass 10 Hz."""
+    T = 1.0 / sample_rate
+    sqrt_delta = math.sqrt(2.0 * T)
+    alpha = 1.0 - damping * T
+    beta = sqrt_delta * amount
+    gamma = damping * mean * T
+
+    noise = torch.randn(num_samples) / 2.33
+    y = torch.zeros(num_samples)
+    state = 0.0
+    for n in range(num_samples):
+        state = alpha * state + beta * noise[n].item() + gamma
+        y[n] = state
+
+    # Lowpass EMA a 10 Hz
+    cutoff = 10.0
+    rc = 1.0 / (2.0 * math.pi * cutoff)
+    ema_alpha = T / (rc + T)
+    state = y[0].item()
+    for n in range(num_samples):
+        state = state + ema_alpha * (y[n].item() - state)
+        y[n] = state
+
+    return y
+
+
+def _wow_lfo(num_samples: int, sample_rate: int,
+             wow_rate: float, wow_depth: float,
+             ou_signal: torch.Tensor = None,
+             max_delay_ms: float = 10.0) -> torch.Tensor:
+    """Genera LFO de wow: coseno + opcional OU.
+
+    Args:
+        max_delay_ms: Delay máximo en ms cuando wow_depth=1.0.
+    """
+    wow_freq = 4.5 ** wow_rate - 1.0
+    # Delay amplitude en samples: lineal con depth
+    amplitude = wow_depth * max_delay_ms * sample_rate / 2000.0
+
+    t = torch.arange(num_samples, dtype=torch.float32)
+    phase = 2.0 * math.pi * wow_freq * t / sample_rate
+
+    if ou_signal is not None:
+        lfo = amplitude * (torch.cos(phase) + ou_signal)
+    else:
+        lfo = amplitude * torch.cos(phase)
+
+    # DC offset para que delay >= 0
+    dc_offset = amplitude
+    return lfo + dc_offset
+
+
+def _flutter_lfo(num_samples: int, sample_rate: int,
+                 flutter_rate: float, flutter_depth: float,
+                 max_delay_ms: float = 0.5) -> torch.Tensor:
+    """Genera LFO de flutter: 3 armónicos con amplitudes fijas.
+
+    Args:
+        max_delay_ms: Delay máximo en ms cuando flutter_depth=1.0.
+    """
+    flutter_freq = 0.1 * (1000.0 ** flutter_rate)
+    amplitude = flutter_depth * max_delay_ms * sample_rate / 2000.0
+
+    t = torch.arange(num_samples, dtype=torch.float32)
+    phase = 2.0 * math.pi * flutter_freq * t / sample_rate
+
+    # 3 armónicos normalizados (amplitudes originales: 230, 80, 99 → peak ~409)
+    raw = (-230.0 * torch.cos(phase)
+           + -80.0 * torch.cos(2.0 * phase + 13.0 * math.pi / 4.0)
+           + -99.0 * torch.cos(3.0 * phase - math.pi / 10.0))
+    lfo = amplitude * raw / 409.0
+
+    dc_offset = amplitude
+    return lfo + dc_offset
+
+
+def _variable_delay(x: torch.Tensor, delay_samples: torch.Tensor,
+                    interpolation: str = "linear") -> torch.Tensor:
+    """Aplica delay variable por muestra. x: [1, samples], delay_samples: [samples]."""
+    num_samples = x.shape[-1]
+    x_flat = x.squeeze(0)
+
+    indices = torch.arange(num_samples, dtype=torch.float32) - delay_samples
+    indices = torch.clamp(indices, 0.0, num_samples - 1.0)
+
+    if interpolation == "lagrange3":
+        idx_base = indices.long()
+        frac = indices - idx_base.float()
+
+        idx_m1 = torch.clamp(idx_base - 1, 0, num_samples - 1)
+        idx_0 = torch.clamp(idx_base, 0, num_samples - 1)
+        idx_p1 = torch.clamp(idx_base + 1, 0, num_samples - 1)
+        idx_p2 = torch.clamp(idx_base + 2, 0, num_samples - 1)
+
+        s_m1 = x_flat[idx_m1]
+        s_0 = x_flat[idx_0]
+        s_p1 = x_flat[idx_p1]
+        s_p2 = x_flat[idx_p2]
+
+        d = frac
+        y = (s_m1 * (-d * (d - 1) * (d - 2) / 6)
+             + s_0 * ((d + 1) * (d - 1) * (d - 2) / 2)
+             + s_p1 * (-(d + 1) * d * (d - 2) / 2)
+             + s_p2 * ((d + 1) * d * (d - 1) / 6))
+    else:
+        idx_floor = indices.long()
+        idx_ceil = torch.clamp(idx_floor + 1, max=num_samples - 1)
+        frac = indices - idx_floor.float()
+        y = torch.lerp(x_flat[idx_floor], x_flat[idx_ceil], frac)
+
+    return y.unsqueeze(0)
+
+
+def wow_flutter(x: torch.Tensor, depth: float, sample_rate: int = 22050,
+                wow_rate: float = 0.4, flutter_rate: float = 0.5,
+                enable_ou: bool = True, interpolation: str = "linear") -> torch.Tensor:
+    """
+    Aplica wow/flutter (time-base distortion) al audio.
+
+    Args:
+        x: Audio tensor [1, samples]
+        depth: Profundidad combinada [0, 1]. Parámetro de clasificación.
+        sample_rate: Tasa de muestreo
+        wow_rate: Tasa de wow [0,1] → 0-3.5 Hz
+        flutter_rate: Tasa de flutter [0,1] → 0.1-100 Hz
+        enable_ou: Agrega proceso Ornstein-Uhlenbeck al wow
+        interpolation: "linear" o "lagrange3"
+
+    Returns:
+        Audio con wow/flutter aplicado [1, samples]
+    """
+    num_samples = x.shape[-1]
+
+    ou_signal = None
+    if enable_ou and depth > 0.01:
+        ou_signal = _ornstein_uhlenbeck(num_samples, sample_rate)
+
+    wow = _wow_lfo(num_samples, sample_rate, wow_rate, depth, ou_signal)
+    flutter = _flutter_lfo(num_samples, sample_rate, flutter_rate, depth)
+
+    total_delay = wow + flutter
+    total_delay = torch.clamp(total_delay, 0.0)
+
+    y = _variable_delay(x, total_delay, interpolation)
+
+    # DC blocker: highpass a 15 Hz
+    y = torchaudio.functional.highpass_biquad(y, sample_rate, 15.0)
+
+    return y
+
+
 class TapeSaturationDataset(torch.utils.data.Dataset):
     """
     Dataset para entrenar modelos de tape saturation.
@@ -93,7 +255,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         min_param: Parámetro mínimo para saturación
         max_param: Parámetro máximo para saturación
         num_classes: Número de clases discretas
-        saturation_model: "tanh", "ja" (Jiles-Atherton) o "hard_clipping"
+        degradation_model: "tanh", "ja" (Jiles-Atherton) o "hard_clipping"
         log_scale: Si True, usa escala logarítmica (solo para JA)
         ext: Extensión de archivos de audio
     """
@@ -112,7 +274,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         min_param: float = 0.2,
         max_param: float = 0.5,
         num_classes: int = 3,
-        saturation_model: str = "ja",
+        degradation_model: str = "ja",
         log_scale: bool = True,
         ext: str = "mp3",
         sample_rate: int = None,
@@ -132,7 +294,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         self.half = half
         self.num_examples_per_epoch = num_examples_per_epoch
         self.num_classes = num_classes
-        self.saturation_model = saturation_model
+        self.degradation_model = degradation_model
         self.log_scale = log_scale
         self.ext = ext
 
@@ -153,8 +315,19 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         else:
             self.param_values = list(np.linspace(min_param, max_param, num_classes))
 
-        model_names = {"ja": "Jiles-Atherton", "tanh": "tanh", "hard_clipping": "Hard Clipping"}
-        model_name = model_names.get(saturation_model, saturation_model)
+        # Wow/flutter config
+        self.wow_rate = kwargs.get("wow_rate", 0.4)
+        self.flutter_rate = kwargs.get("flutter_rate", 0.5)
+        self.enable_ou = kwargs.get("enable_ou", True)
+        self.wf_interpolation = kwargs.get("wf_interpolation", "linear")
+        self.wf_target_param = kwargs.get("wf_target_param", "depth")  # "depth" o "rate"
+        self.wf_fixed_depth = kwargs.get("wf_fixed_depth", 0.5)
+
+        model_names = {
+            "ja": "Jiles-Atherton", "tanh": "tanh",
+            "hard_clipping": "Hard Clipping", "wow_flutter": "Wow/Flutter",
+        }
+        model_name = model_names.get(degradation_model, degradation_model)
         print(f"{model_name} param values ({num_classes} classes): {[f'{p:.3f}' for p in self.param_values]}")
 
         # Buscar archivos de audio
@@ -297,10 +470,19 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         # Seleccionar clase aleatoria y obtener su parámetro
         class_idx = rng.randint(0, self.num_classes - 1)
         param = self.param_values[class_idx]
-        if self.saturation_model == "ja":
+        if self.degradation_model == "ja":
             y = ja_saturation(x, param)
-        elif self.saturation_model == "hard_clipping":
+        elif self.degradation_model == "hard_clipping":
             y = hard_clipping(x, param)
+        elif self.degradation_model == "wow_flutter":
+            if self.wf_target_param == "rate":
+                y = wow_flutter(x, self.wf_fixed_depth, sample_rate=self.sample_rate,
+                                wow_rate=param, flutter_rate=self.flutter_rate,
+                                enable_ou=self.enable_ou, interpolation=self.wf_interpolation)
+            else:
+                y = wow_flutter(x, param, sample_rate=self.sample_rate,
+                                wow_rate=self.wow_rate, flutter_rate=self.flutter_rate,
+                                enable_ou=self.enable_ou, interpolation=self.wf_interpolation)
         else:
             y = tape_saturation(x, param)
 

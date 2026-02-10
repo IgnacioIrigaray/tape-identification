@@ -2,7 +2,7 @@
 Script de evaluación sobre el split de test.
 
 Usa la misma lógica de split determinista que el dataset (seed=42, train_frac=0.8)
-para obtener el 10% de archivos de test, aplica saturación con cada clase de gain,
+para obtener el 10% de archivos de test, aplica la degradación con una clase al azar,
 y evalúa el modelo.
 """
 
@@ -22,11 +22,11 @@ from tqdm import tqdm
 
 from tape_id.models.encoder import SpectralEncoder
 from tape_id.models.controller import ParameterController
-from tape_id.data.dataset import hard_clipping
+from tape_id.data.dataset import hard_clipping, tape_saturation, ja_saturation, wow_flutter
 from tape_id.utils import split_dataset, conform_length, linear_fade
 
 
-def load_model(checkpoint_path: str, device: str = "cpu", num_classes: int = 3, sample_rate: int = 22050):
+def load_model(checkpoint_path: str, device: str = "cpu", num_classes: int = 10, sample_rate: int = 22050):
     """Carga modelo desde checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
@@ -57,8 +57,25 @@ def get_test_files(audio_dir, input_dirs, ext="mp3", train_frac=0.8):
     # Mismo shuffle determinista que dataset.py
     rng_split = random.Random(42)
     rng_split.shuffle(filepaths)
-    return split_dataset(filepaths, "test" \
-    "", train_frac)
+    return split_dataset(filepaths, "test", train_frac)
+
+
+def apply_degradation(x, param, args):
+    """Aplica la degradación configurada al audio."""
+    if args.degradation_model == "wow_flutter":
+        if args.wf_target_param == "rate":
+            return wow_flutter(x, args.wf_fixed_depth, sample_rate=args.sample_rate,
+                               wow_rate=param, flutter_rate=args.flutter_rate,
+                               enable_ou=args.enable_ou, interpolation=args.wf_interpolation)
+        return wow_flutter(x, param, sample_rate=args.sample_rate,
+                           wow_rate=args.wow_rate, flutter_rate=args.flutter_rate,
+                           enable_ou=args.enable_ou, interpolation=args.wf_interpolation)
+    elif args.degradation_model == "hard_clipping":
+        return hard_clipping(x, param)
+    elif args.degradation_model == "ja":
+        return ja_saturation(x, param)
+    else:
+        return tape_saturation(x, param)
 
 
 def main():
@@ -69,28 +86,43 @@ def main():
     parser.add_argument("--ext", type=str, default="mp3")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--num_classes", type=int, default=10)
-    parser.add_argument("--min_gain", type=float, default=1.0)
-    parser.add_argument("--max_gain", type=float, default=10.0)
+    parser.add_argument("--min_gain", type=float, default=0.05)
+    parser.add_argument("--max_gain", type=float, default=1.0)
     parser.add_argument("--log_scale", action="store_true", help="Use log (geomspace) instead of linear")
     parser.add_argument("--sample_rate", type=int, default=22050)
     parser.add_argument("--max_files", type=int, default=0, help="Max test files (0=all)")
-    parser.add_argument("--audio_length", type=int, default=65536, help="Audio length in samples (must match training)")
+    parser.add_argument("--audio_length", type=int, default=65536, help="Audio length in samples")
+    # Degradation model
+    parser.add_argument("--degradation_model", type=str, default="wow_flutter",
+                        choices=["hard_clipping", "tanh", "ja", "wow_flutter"])
+    # Wow/flutter params
+    parser.add_argument("--wow_rate", type=float, default=0.4)
+    parser.add_argument("--flutter_rate", type=float, default=0.5)
+    parser.add_argument("--enable_ou", action="store_true", default=True)
+    parser.add_argument("--no_ou", action="store_true", help="Disable OU process")
+    parser.add_argument("--wf_interpolation", type=str, default="linear", choices=["linear", "lagrange3"])
+    parser.add_argument("--wf_target_param", type=str, default="depth", choices=["depth", "rate"])
+    parser.add_argument("--wf_fixed_depth", type=float, default=0.5)
     args = parser.parse_args()
+
+    if args.no_ou:
+        args.enable_ou = False
 
     device = args.device
     print(f"Device: {device}")
+    print(f"Degradation: {args.degradation_model}")
 
     # Cargar modelo
     encoder, controller, epoch = load_model(args.checkpoint, device, args.num_classes, args.sample_rate)
     print(f"Model loaded (epoch {epoch})")
 
-    # Gain values (linspace o geomspace, igual que dataset)
+    # Param values (linspace o geomspace, igual que dataset)
     if args.log_scale:
-        gain_values = torch.tensor(np.geomspace(args.min_gain, args.max_gain, args.num_classes), dtype=torch.float32)
+        param_values = torch.tensor(np.geomspace(args.min_gain, args.max_gain, args.num_classes), dtype=torch.float32)
     else:
-        gain_values = torch.tensor(np.linspace(args.min_gain, args.max_gain, args.num_classes), dtype=torch.float32)
-    gain_labels = [f"{g:.2f}" for g in gain_values.tolist()]
-    print(f"Gain values: {gain_values.tolist()}")
+        param_values = torch.tensor(np.linspace(args.min_gain, args.max_gain, args.num_classes), dtype=torch.float32)
+    param_labels = [f"{g:.3f}" for g in param_values.tolist()]
+    print(f"Param values: {param_values.tolist()}")
 
     # Obtener archivos de test
     test_files = get_test_files(args.audio_dir, args.input_dirs, args.ext)
@@ -119,7 +151,6 @@ def main():
         else:
             audio = audio.squeeze(0)
 
-        # Recortar a audio_length (mismo que training)
         if audio.shape[0] > audio_length:
             audio = audio[:audio_length]
 
@@ -127,13 +158,13 @@ def main():
 
         # Sortear una clase al azar
         class_idx = random.randint(0, num_classes - 1)
-        gain = gain_values[class_idx].item()
+        param = param_values[class_idx].item()
         x = audio.unsqueeze(0)
-        audio_sat = hard_clipping(x, gain)
-        audio_sat = conform_length(audio_sat, audio_length)
-        audio_sat = linear_fade(audio_sat, sample_rate=sample_rate)
+        audio_deg = apply_degradation(x, param, args)
+        audio_deg = conform_length(audio_deg, audio_length)
+        audio_deg = linear_fade(audio_deg, sample_rate=sample_rate)
 
-        y = audio_sat.unsqueeze(0).to(device)
+        y = audio_deg.unsqueeze(0).to(device)
         with torch.no_grad():
             e_y = encoder(y)
             logits = controller(e_y)
@@ -152,21 +183,19 @@ def main():
     print("=" * 60)
     print(f"Accuracy: {correct}/{total} = {accuracy:.1f}%")
 
-    # Accuracy por clase
     print(f"\nPer-class accuracy:")
     for i in range(num_classes):
         class_total = confusion[i].sum()
         class_correct = confusion[i][i]
         class_acc = 100 * class_correct / class_total if class_total > 0 else 0
-        print(f"  gain={gain_labels[i]:>6}: {class_correct}/{class_total} = {class_acc:.1f}%")
+        print(f"  p={param_labels[i]:>6}: {class_correct}/{class_total} = {class_acc:.1f}%")
 
-    # Matriz de confusión
     print(f"\nConfusion matrix (rows=real, cols=predicted):")
-    header = "".join(f"{gain_labels[i]:>10}" for i in range(num_classes))
+    header = "".join(f"{param_labels[i]:>10}" for i in range(num_classes))
     print(f"{'':>10}{header}")
     for i in range(num_classes):
         row = "".join(f"{confusion[i][j]:>10d}" for j in range(num_classes))
-        print(f"{'g=' + gain_labels[i]:>10}{row}")
+        print(f"{'p=' + param_labels[i]:>10}{row}")
 
 
 if __name__ == "__main__":
