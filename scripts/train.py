@@ -39,7 +39,10 @@ def main():
         # Modelo
         "embed_dim": 1024,
         "hidden_dim": 256,
-        "params_reg_weight": 0, # peso de regularizacion basada en params
+        "num_layers": 2,
+        "dropout_rate": 0,
+        "params_reg_type": "cat",
+        "params_reg_weight": 1.0, # peso de regularizacion basada en params
         "min_gain": 1.0,  # Hard clipping: gain=1 es bypass
         "max_gain": 4.0,  # gain=4 es clipping severo
         "num_classes": 3,
@@ -136,6 +139,8 @@ def main():
         num_classes=config["num_classes"],
         embed_dim=config["embed_dim"],
         hidden_dim=config["hidden_dim"],
+        num_layers=config["num_layers"],
+        dropout_rate=config["dropout_rate"]
     )
 
     processor = HardClippingProcessor(
@@ -178,6 +183,7 @@ def main():
         val_loader=val_loader,
         loss_fn=loss_fn,
         params_reg_weight=config["params_reg_weight"],
+        params_reg_type=config["params_reg_type"],
         optimizer=optimizer,
         scheduler=scheduler,
         device=config["device"],

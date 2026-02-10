@@ -20,7 +20,9 @@ class ParameterController(nn.Module):
         num_classes: Número de clases discretas a predecir (default: 10)
         embed_dim: Dimensión de los embeddings del encoder
         hidden_dim: Dimensión oculta del MLP predictor
+        num_layers: Número de capas ocultas en el MLP (default: 3)
         agg_method: Método de agregación de embeddings ["mlp", "linear"]
+        activation: Función de activación (default: nn.LeakyReLU)
     """
 
     def __init__(
@@ -28,13 +30,18 @@ class ParameterController(nn.Module):
         num_classes: int = 10,
         embed_dim: int = 128,
         hidden_dim: int = 256,
+        num_layers: int = 10,
+        dropout_rate: float = 0.3,
         agg_method: str = "mlp",
+        activation: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         self.agg_method = agg_method
+        self.activation = activation or nn.LeakyReLU(0.01)
 
         # Agregación de embeddings x e y
         if agg_method == "linear":
@@ -46,17 +53,16 @@ class ParameterController(nn.Module):
         else:
             raise ValueError(f"Invalid agg_method: {agg_method}")
 
-        # MLP predictor de clases (logits, sin activación final)
-        self.mlp = nn.Sequential(
-            nn.Linear(mlp_in_dim, hidden_dim),
-            nn.LeakyReLU(0.01),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.01),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, num_classes),
-            # Sin Sigmoid - retorna logits para softmax en processor
-        )
+        # Construir MLP predictor de clases
+        layers = []
+        in_dim = mlp_in_dim
+        for i in range(num_layers):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(self.activation)
+            layers.append(nn.Dropout(dropout_rate))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(hidden_dim, num_classes))
+        self.mlp = nn.Sequential(*layers)
 
     def forward(
         self,

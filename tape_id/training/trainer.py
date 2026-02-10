@@ -55,8 +55,9 @@ class TapeIdentificationTrainer:
         self.val_loader = val_loader
         self.loss_fn = loss_fn.to(device)
         self.optimizer = optimizer
+        self.temperature = 3
         self.params_reg_weight = params_reg_weight
-        self.params_reg_type = nn.CrossEntropyLoss() if params_reg_type=='cat' else nn.L1Loss()
+        self.params_reg_type = nn.CrossEntropyLoss(label_smoothing=0.1) if params_reg_type=='cat' else nn.L1Loss()
         self.scheduler = scheduler
         self.device = device
         self.output_dir = Path(output_dir)
@@ -73,7 +74,7 @@ class TapeIdentificationTrainer:
         self.global_step = 0
 
         # Early stopping
-        self.patience = 15
+        self.patience = 8
         self.patience_counter = 0
         self.min_delta = 0.001
 
@@ -125,7 +126,7 @@ class TapeIdentificationTrainer:
             if self.params_reg_weight > 0 and params is not None:
                 # params: [batch] or [batch, 1] (float gain)
                 # Find closest gain value index for each param
-                target_class = torch.argmin(torch.abs(gain_values.unsqueeze(0) - params.unsqueeze(1)), dim=1).unsqueeze(1)
+                target_class = torch.argmin(torch.abs(gain_values.unsqueeze(0) - params.unsqueeze(1)), dim=1)
                 loss_params = self.params_reg_type(logits, target_class)
                 # Gather both losses
                 loss = loss_signal + self.params_reg_weight * loss_params
@@ -195,17 +196,17 @@ class TapeIdentificationTrainer:
 
             e_x = self.encoder(x)
             e_y = self.encoder(y)
-            logits = self.controller(e_x, e_y)
+            logits = self.controller(e_x, e_y) / self.temperature
             y_pred = self.processor(x, logits, use_argmax=False)
             gain_values = self.gain_values.to(params.device)
 
-            target_class = torch.argmin(torch.abs(gain_values.unsqueeze(0) - params.unsqueeze(1)), dim=1).unsqueeze(1)
+            target_class = torch.argmin(torch.abs(gain_values.unsqueeze(0) - params.unsqueeze(1)), dim=1)
             loss_signal = self.loss_fn(y_pred.squeeze(1), y.squeeze(1))
             total_loss_signal += loss_signal.item()
 
             # Categorical parameter loss
             if self.params_reg_weight > 0 and params is not None:
-                loss_params = self.params_reg_type(logits, target_class.unsqueeze(1))
+                loss_params = self.params_reg_type(logits, target_class)
                 loss = loss_signal + self.params_reg_weight * loss_params
                 total_loss_params += loss_params.item() 
       
@@ -219,7 +220,7 @@ class TapeIdentificationTrainer:
             all_gain_preds.append(gain_pred.cpu())
 
             # Métrica de accuracy para clasificación categórica
-            pred_class = torch.argmax(logits, dim=1, keepdim=True)
+            pred_class = torch.argmax(logits, dim=1, keepdim=False)
             correct_params += (pred_class == target_class).sum().item()
             total_params += target_class.size(0)
 
@@ -396,3 +397,10 @@ class TapeIdentificationTrainer:
             print(f"  tensorboard --logdir={self.log_dir}")
 
             self.writer.close()
+# import soundfile as sf
+# x_path = "/home/emartinez/emilio/csic_restauracion/tape-identification/outputs/debugs/audios/x.wav"
+# sf.write(x_path, x[0].detach().cpu().numpy().squeeze(0).astype("float32"), 24000, format="WAV", subtype="FLOAT")
+# y_path = "/home/emartinez/emilio/csic_restauracion/tape-identification/outputs/debugs/audios/y.wav"
+# sf.write(y_path, y[0].detach().cpu().numpy().squeeze(0).astype("float32"), 24000, format="WAV", subtype="FLOAT")
+# y_pred_path = "/home/emartinez/emilio/csic_restauracion/tape-identification/outputs/debugs/audios/y_pred.wav"
+# sf.write(y_pred_path, y_pred[0].detach().cpu().numpy().squeeze(0).astype("float32"), 24000, format="WAV", subtype="FLOAT")
