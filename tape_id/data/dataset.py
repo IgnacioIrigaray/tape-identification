@@ -36,30 +36,157 @@ def tape_saturation(x: torch.Tensor, gain: float) -> torch.Tensor:
     return torch.tanh(x * gain)
 
 
-def _langevin(x: torch.Tensor) -> torch.Tensor:
-    """Función de Langevin: L(x) = coth(x) - 1/x"""
-    small = torch.abs(x) < 0.01
-    result = torch.zeros_like(x)
-    result[small] = x[small] / 3.0
-    large = ~small
-    result[large] = 1.0 / torch.tanh(x[large]) - 1.0 / x[large]
-    return result
+# ---------------------------------------------------------------------------
+# Jiles-Atherton hysteresis model
+# Portado de AnalogTapeModel (Jatin Chowdhury) — RK4 solver, numba-optimizado
+# ---------------------------------------------------------------------------
+
+import numba
+
+_JA_ALPHA = 1.6e-3      # mean-field coupling (constante)
+_JA_K = 0.47875          # coercivity (constante en modo standard)
+_JA_DERIV_ALPHA = 0.75   # alpha-transform para dH/dt
+_JA_UPPER_LIM = 20.0     # límite de inestabilidad
+_JA_CLIP_LEVEL = 10.0    # clip de entrada (RK4)
 
 
-def ja_saturation(x: torch.Tensor, a: float) -> torch.Tensor:
+@numba.njit(cache=True)
+def _ja_hysteresis_loop(x_np, M_s, a, c, k, makeup, T):
+    """Loop RK4 compilado con numba. Input/output: numpy arrays."""
+    alpha = 1.6e-3
+    deriv_alpha = 0.75
+    clip = 10.0
+    upper_lim = 20.0
+    num_samples = x_np.shape[0]
+    y = np.empty(num_samples, dtype=np.float64)
+
+    nc = 1.0 - c
+    M_n1 = 0.0
+    H_n1 = 0.0
+    H_d_n1 = 0.0
+
+    for n in range(num_samples):
+        H_n = x_np[n]
+        if H_n > clip:
+            H_n = clip
+        elif H_n < -clip:
+            H_n = -clip
+
+        # dH/dt alpha-transform
+        H_d_n = ((1.0 + deriv_alpha) / T) * (H_n - H_n1) - deriv_alpha * H_d_n1
+
+        # --- RK4 inline (4 evaluations of hysteresis_func) ---
+        H_mid = (H_n + H_n1) * 0.5
+        H_d_mid = (H_d_n + H_d_n1) * 0.5
+
+        # Evaluate at 4 stages: (M_eval, H_eval, H_d_eval)
+        # Stage params: [(M_n1, H_n1, H_d_n1), (M+k1/2, Hmid, Hdmid),
+        #                (M+k2/2, Hmid, Hdmid), (M+k3, H_n, H_d_n)]
+        M_eval = M_n1
+        H_eval = H_n1
+        H_d_eval = H_d_n1
+
+        kk = 0.0  # acumulador RK4: M = M_n1 + kk
+        for stage in range(4):
+            Q = (H_eval + alpha * M_eval) / a
+            # Langevin
+            if abs(Q) < 0.001:
+                L = Q / 3.0
+                L_prime = 1.0 / 3.0
+            else:
+                coth_Q = 1.0 / math.tanh(Q)
+                L = coth_Q - 1.0 / Q
+                L_prime = 1.0 / (Q * Q) - coth_Q * coth_Q + 1.0
+
+            M_diff = M_s * L - M_eval
+            delta = 1.0 if H_d_eval >= 0.0 else -1.0
+            # kappa gate
+            d_sign = 1.0 if delta >= 0.0 else -1.0
+            md_sign = 1.0 if M_diff >= 0.0 else -1.0
+            kap = nc if d_sign == md_sign else 0.0
+
+            f1_den = nc * delta * k - alpha * M_diff
+            if abs(f1_den) < 1e-12:
+                f1_den = 1e-12 if f1_den >= 0.0 else -1e-12
+            f1 = kap * M_diff / f1_den
+            f2 = L_prime * c * M_s / a
+            f3 = 1.0 - L_prime * alpha * c * M_s / a
+            if abs(f3) < 1e-12:
+                f3 = 1e-12
+
+            dMdt = H_d_eval * (f1 + f2) / f3
+            ki = dMdt * T
+
+            if stage == 0:
+                kk = ki / 6.0
+                M_eval = M_n1 + ki * 0.5
+                H_eval = H_mid
+                H_d_eval = H_d_mid
+            elif stage == 1:
+                kk += ki / 3.0
+                M_eval = M_n1 + ki * 0.5
+                # H_eval, H_d_eval ya son mid
+            elif stage == 2:
+                kk += ki / 3.0
+                M_eval = M_n1 + ki
+                H_eval = H_n
+                H_d_eval = H_d_n
+            else:
+                kk += ki / 6.0
+
+        M_n = M_n1 + kk
+
+        # Guard
+        if math.isnan(M_n) or M_n > upper_lim or M_n < -upper_lim:
+            M_n = 0.0
+            H_d_n = 0.0
+
+        y[n] = M_n * makeup
+        M_n1 = M_n
+        H_n1 = H_n
+        H_d_n1 = H_d_n
+
+    return y
+
+
+def ja_hysteresis(x: torch.Tensor, drive: float, sample_rate: int = 22050,
+                  saturation: float = 0.5, width: float = 0.5) -> torch.Tensor:
     """
-    Aplica saturación usando modelo Jiles-Atherton.
+    Aplica saturación con histéresis de Jiles-Atherton (modelo completo con estado).
 
-    Fórmula: y = 3a * L(x/a) donde L es la función de Langevin
+    Portado de AnalogTapeModel (Jatin Chowdhury), solver RK4.
 
     Args:
-        x: Audio tensor [channels, samples]
-        a: Parámetro de forma (a pequeño = más saturación)
+        x: Audio tensor [1, samples]
+        drive: Intensidad de saturación [0, 1]. Parámetro de clasificación.
+        sample_rate: Tasa de muestreo
+        saturation: Sat del material [0, 1] (0=headroom alto, 1=headroom bajo)
+        width: Ancho de histéresis [0, 1] (0=sin histéresis, 1=máxima)
 
     Returns:
-        Audio saturado
+        Audio con histéresis [1, samples]
     """
-    return 3.0 * a * _langevin(x / a)
+    # Cook: user params -> JA params
+    M_s = 0.5 + 1.5 * (1.0 - saturation)
+    a = M_s / (0.01 + 6.0 * drive)
+    c = math.sqrt(1.0 - width) - 0.01
+    c = max(c, 0.001)
+    k = _JA_K
+    makeup = (1.0 + 0.6 * width) / M_s
+    T = 1.0 / sample_rate
+
+    x_np = x.squeeze(0).numpy().astype(np.float64)
+    y_np = _ja_hysteresis_loop(x_np, M_s, a, c, k, makeup, T)
+
+    y = torch.from_numpy(y_np).float().unsqueeze(0)
+    y = torchaudio.functional.highpass_biquad(y, sample_rate, 35.0)
+    return y
+
+
+def ja_saturation(x: torch.Tensor, drive: float, sample_rate: int = 22050,
+                  saturation: float = 0.5, width: float = 0.5) -> torch.Tensor:
+    """Alias para ja_hysteresis (backward compat)."""
+    return ja_hysteresis(x, drive, sample_rate, saturation, width)
 
 
 def hard_clipping(x: torch.Tensor, gain: float) -> torch.Tensor:
@@ -320,15 +447,33 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         self.flutter_rate = kwargs.get("flutter_rate", 0.5)
         self.enable_ou = kwargs.get("enable_ou", True)
         self.wf_interpolation = kwargs.get("wf_interpolation", "linear")
-        self.wf_target_param = kwargs.get("wf_target_param", "depth")  # "depth" o "rate"
+        self.wf_target_param = kwargs.get("wf_target_param", "depth")  # "depth", "rate" o "both"
         self.wf_fixed_depth = kwargs.get("wf_fixed_depth", 0.5)
 
-        model_names = {
-            "ja": "Jiles-Atherton", "tanh": "tanh",
-            "hard_clipping": "Hard Clipping", "wow_flutter": "Wow/Flutter",
-        }
-        model_name = model_names.get(degradation_model, degradation_model)
-        print(f"{model_name} param values ({num_classes} classes): {[f'{p:.3f}' for p in self.param_values]}")
+        # Modo dual-param: depth + rate independientes
+        if self.wf_target_param == "both":
+            self.num_classes_depth = kwargs.get("num_classes_depth", num_classes)
+            self.num_classes_rate = kwargs.get("num_classes_rate", num_classes)
+            self.depth_values = list(np.linspace(
+                kwargs.get("min_depth", min_param),
+                kwargs.get("max_depth", max_param),
+                self.num_classes_depth,
+            ))
+            self.rate_values = list(np.linspace(
+                kwargs.get("min_rate", min_param),
+                kwargs.get("max_rate", max_param),
+                self.num_classes_rate,
+            ))
+            print(f"Wow/Flutter DUAL param mode:")
+            print(f"  Depth values ({self.num_classes_depth} classes): {[f'{p:.3f}' for p in self.depth_values]}")
+            print(f"  Rate values ({self.num_classes_rate} classes): {[f'{p:.3f}' for p in self.rate_values]}")
+        else:
+            model_names = {
+                "ja": "Jiles-Atherton", "tanh": "tanh",
+                "hard_clipping": "Hard Clipping", "wow_flutter": "Wow/Flutter",
+            }
+            model_name = model_names.get(degradation_model, degradation_model)
+            print(f"{model_name} param values ({num_classes} classes): {[f'{p:.3f}' for p in self.param_values]}")
 
         # Buscar archivos de audio
         self.input_filepaths = []
@@ -467,11 +612,23 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         # Normalizar a 0 dBFS (amplitud máxima = 1.0)
         x = x / (x.abs().max() + 1e-8)
 
-        # Seleccionar clase aleatoria y obtener su parámetro
+        # Seleccionar clase(s) y aplicar degradación
+        if self.degradation_model == "wow_flutter" and self.wf_target_param == "both":
+            depth_idx = rng.randint(0, self.num_classes_depth - 1)
+            rate_idx = rng.randint(0, self.num_classes_rate - 1)
+            depth_val = self.depth_values[depth_idx]
+            rate_val = self.rate_values[rate_idx]
+            y = wow_flutter(x, depth_val, sample_rate=self.sample_rate,
+                            wow_rate=rate_val, flutter_rate=self.flutter_rate,
+                            enable_ou=self.enable_ou, interpolation=self.wf_interpolation)
+            y = utils.conform_length(y, self.length)
+            y = utils.linear_fade(y, sample_rate=self.sample_rate)
+            return y, depth_idx, rate_idx
+
         class_idx = rng.randint(0, self.num_classes - 1)
         param = self.param_values[class_idx]
         if self.degradation_model == "ja":
-            y = ja_saturation(x, param)
+            y = ja_saturation(x, param, sample_rate=self.sample_rate)
         elif self.degradation_model == "hard_clipping":
             y = hard_clipping(x, param)
         elif self.degradation_model == "wow_flutter":
@@ -486,10 +643,6 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         else:
             y = tape_saturation(x, param)
 
-        # Conformar longitud
         y = utils.conform_length(y, self.length)
-
-        # Aplicar fade
         y = utils.linear_fade(y, sample_rate=self.sample_rate)
-
         return y, class_idx

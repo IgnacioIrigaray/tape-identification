@@ -37,18 +37,11 @@ def main():
         # Modelo
         "embed_dim": 1024,
         "hidden_dim": 256,
-        "min_gain": 0.1,
-        "max_gain": 0.8,
-        "num_classes": 3,
-        "degradation_model": "wow_flutter",
+        "degradation_model": "ja",
         "log_scale": False,
-
-        # Wow/flutter
-        "wf_target_param": "rate",    # clasificar por rate (depth fijo)
-        "wf_fixed_depth": 0.5,        # depth fijo a 5 ms
-        "flutter_rate": 0.0,
-        "enable_ou": False,
-        "wf_interpolation": "linear",
+        "num_classes": 3,
+        "min_gain": 1.0,
+        "max_gain": 3.0,
 
         # Training
         "num_epochs": 400,
@@ -85,6 +78,12 @@ def main():
         wf_interpolation=config.get("wf_interpolation", "linear"),
         wf_target_param=config.get("wf_target_param", "depth"),
         wf_fixed_depth=config.get("wf_fixed_depth", 0.5),
+        num_classes_depth=config.get("num_classes_depth"),
+        num_classes_rate=config.get("num_classes_rate"),
+        min_depth=config.get("min_depth"),
+        max_depth=config.get("max_depth"),
+        min_rate=config.get("min_rate"),
+        max_rate=config.get("max_rate"),
     )
 
     train_dataset = TapeSaturationDataset(
@@ -135,11 +134,19 @@ def main():
         width_mult=2,
     )
 
-    controller = ParameterController(
-        num_classes=config["num_classes"],
-        embed_dim=config["embed_dim"],
-        hidden_dim=config["hidden_dim"],
-    )
+    if config.get("wf_target_param") == "both":
+        controller = ParameterController(
+            embed_dim=config["embed_dim"],
+            hidden_dim=config["hidden_dim"],
+            num_classes_depth=config["num_classes_depth"],
+            num_classes_rate=config["num_classes_rate"],
+        )
+    else:
+        controller = ParameterController(
+            num_classes=config["num_classes"],
+            embed_dim=config["embed_dim"],
+            hidden_dim=config["hidden_dim"],
+        )
 
     # Mostrar resumen del modelo
     model_summary(encoder, controller)

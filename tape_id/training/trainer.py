@@ -17,18 +17,8 @@ class TapeIdentificationTrainer:
     """
     Trainer para modelo de identificación de parámetros.
 
-    Entrena encoder + controller con CrossEntropyLoss directo.
-    Solo recibe audio saturado y predice la clase de parámetro.
-
-    Args:
-        encoder: Encoder model
-        controller: Controller model
-        train_loader: Training dataloader
-        val_loader: Validation dataloader
-        optimizer: Optimizer
-        device: Device (cuda/cpu)
-        output_dir: Directorio para guardar checkpoints
-        log_dir: Directorio para logs de TensorBoard
+    Soporta modo single-param y multi-param (dual head).
+    Detecta el modo automáticamente desde controller.multi_param.
     """
 
     def __init__(
@@ -53,6 +43,9 @@ class TapeIdentificationTrainer:
         self.device = device
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Detectar modo multi-param
+        self.multi_param = getattr(controller, 'multi_param', False)
 
         # TensorBoard writer
         self.log_dir = Path(log_dir)
@@ -85,49 +78,88 @@ class TapeIdentificationTrainer:
         self.controller.train()
 
         total_loss = 0.0
-        correct = 0
-        total = 0
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
 
-        for batch_idx, (y, class_idx) in enumerate(pbar):
-            y = y.to(self.device)
-            class_idx = class_idx.to(self.device)
+        if self.multi_param:
+            correct_depth = 0
+            correct_rate = 0
+            correct_both = 0
+            total = 0
 
-            # Forward pass
-            e_y = self.encoder(y)
-            logits = self.controller(e_y)
+            for batch_idx, (y, depth_idx, rate_idx) in enumerate(pbar):
+                y = y.to(self.device)
+                depth_idx = depth_idx.to(self.device)
+                rate_idx = rate_idx.to(self.device)
 
-            # Loss directo sobre logits
-            loss = self.loss_fn(logits, class_idx)
+                e_y = self.encoder(y)
+                logits = self.controller(e_y)
 
-            # Backward
-            self.optimizer.zero_grad()
-            loss.backward()
+                loss_depth = self.loss_fn(logits["depth"], depth_idx)
+                loss_rate = self.loss_fn(logits["rate"], rate_idx)
+                loss = loss_depth + loss_rate
 
-            torch.nn.utils.clip_grad_norm_(
-                list(self.encoder.parameters()) +
-                list(self.controller.parameters()),
-                max_norm=1.0
-            )
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.encoder.parameters()) +
+                    list(self.controller.parameters()),
+                    max_norm=1.0
+                )
+                self.optimizer.step()
 
-            self.optimizer.step()
+                total_loss += loss.item()
 
-            total_loss += loss.item()
+                preds_d = torch.argmax(logits["depth"], dim=-1)
+                preds_r = torch.argmax(logits["rate"], dim=-1)
+                correct_depth += (preds_d == depth_idx).sum().item()
+                correct_rate += (preds_r == rate_idx).sum().item()
+                correct_both += ((preds_d == depth_idx) & (preds_r == rate_idx)).sum().item()
+                total += depth_idx.size(0)
 
-            # Accuracy
-            preds = torch.argmax(logits, dim=-1)
-            correct += (preds == class_idx).sum().item()
-            total += class_idx.size(0)
+                self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
+                self.global_step += 1
 
-            # TensorBoard logging
-            self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
+                acc_d = correct_depth / total
+                acc_r = correct_rate / total
+                pbar.set_postfix({"loss": f"{loss.item():.3f}", "d": f"{acc_d:.2f}", "r": f"{acc_r:.2f}"})
 
-            self.global_step += 1
-            acc = correct / total
-            pbar.set_postfix({"loss": loss.item(), "acc": f"{acc:.3f}"})
+            self.writer.add_scalar("train/accuracy_depth", correct_depth / total, self.current_epoch)
+            self.writer.add_scalar("train/accuracy_rate", correct_rate / total, self.current_epoch)
+            self.writer.add_scalar("train/accuracy_combined", correct_both / total, self.current_epoch)
 
-        epoch_acc = correct / total
-        self.writer.add_scalar("train/accuracy", epoch_acc, self.current_epoch)
+        else:
+            correct = 0
+            total = 0
+
+            for batch_idx, (y, class_idx) in enumerate(pbar):
+                y = y.to(self.device)
+                class_idx = class_idx.to(self.device)
+
+                e_y = self.encoder(y)
+                logits = self.controller(e_y)
+                loss = self.loss_fn(logits, class_idx)
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.encoder.parameters()) +
+                    list(self.controller.parameters()),
+                    max_norm=1.0
+                )
+                self.optimizer.step()
+
+                total_loss += loss.item()
+
+                preds = torch.argmax(logits, dim=-1)
+                correct += (preds == class_idx).sum().item()
+                total += class_idx.size(0)
+
+                self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
+                self.global_step += 1
+                acc = correct / total
+                pbar.set_postfix({"loss": loss.item(), "acc": f"{acc:.3f}"})
+
+            self.writer.add_scalar("train/accuracy", correct / total, self.current_epoch)
 
         return total_loss / len(self.train_loader)
 
@@ -138,29 +170,68 @@ class TapeIdentificationTrainer:
         self.controller.eval()
 
         total_loss = 0.0
-        correct = 0
-        total = 0
 
-        for y, class_idx in tqdm(self.val_loader, desc="Validation"):
-            y = y.to(self.device)
-            class_idx = class_idx.to(self.device)
+        if self.multi_param:
+            correct_depth = 0
+            correct_rate = 0
+            correct_both = 0
+            total = 0
 
-            e_y = self.encoder(y)
-            logits = self.controller(e_y)
+            for y, depth_idx, rate_idx in tqdm(self.val_loader, desc="Validation"):
+                y = y.to(self.device)
+                depth_idx = depth_idx.to(self.device)
+                rate_idx = rate_idx.to(self.device)
 
-            loss = self.loss_fn(logits, class_idx)
-            total_loss += loss.item()
+                e_y = self.encoder(y)
+                logits = self.controller(e_y)
 
-            preds = torch.argmax(logits, dim=-1)
-            correct += (preds == class_idx).sum().item()
-            total += class_idx.size(0)
+                loss_depth = self.loss_fn(logits["depth"], depth_idx)
+                loss_rate = self.loss_fn(logits["rate"], rate_idx)
+                loss = loss_depth + loss_rate
+                total_loss += loss.item()
 
-        avg_loss = total_loss / len(self.val_loader)
-        accuracy = correct / total
+                preds_d = torch.argmax(logits["depth"], dim=-1)
+                preds_r = torch.argmax(logits["rate"], dim=-1)
+                correct_depth += (preds_d == depth_idx).sum().item()
+                correct_rate += (preds_r == rate_idx).sum().item()
+                correct_both += ((preds_d == depth_idx) & (preds_r == rate_idx)).sum().item()
+                total += depth_idx.size(0)
 
-        # TensorBoard logging
-        self.writer.add_scalar("val/loss", avg_loss, self.current_epoch)
-        self.writer.add_scalar("val/accuracy", accuracy, self.current_epoch)
+            avg_loss = total_loss / len(self.val_loader)
+            acc_depth = correct_depth / total
+            acc_rate = correct_rate / total
+            acc_both = correct_both / total
+
+            self.writer.add_scalar("val/loss", avg_loss, self.current_epoch)
+            self.writer.add_scalar("val/accuracy_depth", acc_depth, self.current_epoch)
+            self.writer.add_scalar("val/accuracy_rate", acc_rate, self.current_epoch)
+            self.writer.add_scalar("val/accuracy_combined", acc_both, self.current_epoch)
+
+            print(f"  val acc: depth={acc_depth:.3f}, rate={acc_rate:.3f}, both={acc_both:.3f}")
+
+        else:
+            correct = 0
+            total = 0
+
+            for y, class_idx in tqdm(self.val_loader, desc="Validation"):
+                y = y.to(self.device)
+                class_idx = class_idx.to(self.device)
+
+                e_y = self.encoder(y)
+                logits = self.controller(e_y)
+
+                loss = self.loss_fn(logits, class_idx)
+                total_loss += loss.item()
+
+                preds = torch.argmax(logits, dim=-1)
+                correct += (preds == class_idx).sum().item()
+                total += class_idx.size(0)
+
+            avg_loss = total_loss / len(self.val_loader)
+            accuracy = correct / total
+
+            self.writer.add_scalar("val/loss", avg_loss, self.current_epoch)
+            self.writer.add_scalar("val/accuracy", accuracy, self.current_epoch)
 
         return avg_loss
 
@@ -208,7 +279,8 @@ class TapeIdentificationTrainer:
 
     def train(self, num_epochs: int, resume_from: Optional[str] = None):
         """Ejecuta loop de entrenamiento completo."""
-        print(f"Starting training for {num_epochs} epochs")
+        mode = "multi-param (depth + rate)" if self.multi_param else "single-param"
+        print(f"Starting training for {num_epochs} epochs [{mode}]")
         print(f"Device: {self.device}")
         print(f"Train batches: {len(self.train_loader)}")
         print(f"Val batches: {len(self.val_loader)}")
