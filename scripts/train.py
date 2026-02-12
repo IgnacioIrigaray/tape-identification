@@ -38,10 +38,11 @@ def main():
         "embed_dim": 1024,
         "hidden_dim": 256,
         "degradation_model": "ja",
+        "regression": True,
         "log_scale": False,
         "num_classes": 3,
-        "min_gain": 1.0,
-        "max_gain": 3.0,
+        "min_gain": 1.5,
+        "max_gain": 5.0,
 
         # Training
         "num_epochs": 400,
@@ -72,6 +73,7 @@ def main():
         buffer_size_gb=config["buffer_size_gb"],
         buffer_reload_rate=config["buffer_reload_rate"],
         sample_rate=config["sample_rate"],
+        regression=config.get("regression", False),
         wow_rate=config.get("wow_rate", 0.4),
         flutter_rate=config.get("flutter_rate", 0.5),
         enable_ou=config.get("enable_ou", True),
@@ -134,18 +136,22 @@ def main():
         width_mult=2,
     )
 
+    regression = config.get("regression", False)
+
     if config.get("wf_target_param") == "both":
         controller = ParameterController(
             embed_dim=config["embed_dim"],
             hidden_dim=config["hidden_dim"],
             num_classes_depth=config["num_classes_depth"],
             num_classes_rate=config["num_classes_rate"],
+            regression=regression,
         )
     else:
         controller = ParameterController(
             num_classes=config["num_classes"],
             embed_dim=config["embed_dim"],
             hidden_dim=config["hidden_dim"],
+            regression=regression,
         )
 
     # Mostrar resumen del modelo

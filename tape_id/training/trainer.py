@@ -2,6 +2,7 @@
 Training loop para identificación de parámetros de tape.
 """
 
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -17,8 +18,8 @@ class TapeIdentificationTrainer:
     """
     Trainer para modelo de identificación de parámetros.
 
-    Soporta modo single-param y multi-param (dual head).
-    Detecta el modo automáticamente desde controller.multi_param.
+    Soporta clasificación y regresión, single-param y multi-param.
+    Detecta el modo automáticamente desde controller.multi_param y controller.regression.
     """
 
     def __init__(
@@ -37,15 +38,21 @@ class TapeIdentificationTrainer:
         self.controller = controller.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.loss_fn = nn.CrossEntropyLoss()
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Detectar modo multi-param
+        # Detectar modo
         self.multi_param = getattr(controller, 'multi_param', False)
+        self.regression = getattr(controller, 'regression', False)
+
+        # Loss function
+        if self.regression:
+            self.loss_fn = nn.MSELoss()
+        else:
+            self.loss_fn = nn.CrossEntropyLoss()
 
         # TensorBoard writer
         self.log_dir = Path(log_dir)
@@ -80,7 +87,82 @@ class TapeIdentificationTrainer:
         total_loss = 0.0
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
 
-        if self.multi_param:
+        if self.regression:
+            if self.multi_param:
+                sum_ae_d = 0.0
+                sum_ae_r = 0.0
+                total = 0
+
+                for batch_idx, (y, target_d, target_r) in enumerate(pbar):
+                    y = y.to(self.device)
+                    target_d = target_d.to(self.device).unsqueeze(1)
+                    target_r = target_r.to(self.device).unsqueeze(1)
+
+                    e_y = self.encoder(y)
+                    pred = self.controller(e_y)
+
+                    loss_d = self.loss_fn(pred["depth"], target_d)
+                    loss_r = self.loss_fn(pred["rate"], target_r)
+                    loss = loss_d + loss_r
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.encoder.parameters()) +
+                        list(self.controller.parameters()),
+                        max_norm=1.0
+                    )
+                    self.optimizer.step()
+
+                    total_loss += loss.item()
+                    sum_ae_d += (pred["depth"] - target_d).abs().sum().item()
+                    sum_ae_r += (pred["rate"] - target_r).abs().sum().item()
+                    total += target_d.size(0)
+
+                    self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
+                    self.global_step += 1
+
+                    mae_d = sum_ae_d / total
+                    mae_r = sum_ae_r / total
+                    pbar.set_postfix({"loss": f"{loss.item():.4f}", "mae_d": f"{mae_d:.3f}", "mae_r": f"{mae_r:.3f}"})
+
+                self.writer.add_scalar("train/mae_depth", sum_ae_d / total, self.current_epoch)
+                self.writer.add_scalar("train/mae_rate", sum_ae_r / total, self.current_epoch)
+
+            else:
+                sum_ae = 0.0
+                total = 0
+
+                for batch_idx, (y, target) in enumerate(pbar):
+                    y = y.to(self.device)
+                    target = target.to(self.device).unsqueeze(1)
+
+                    e_y = self.encoder(y)
+                    pred = self.controller(e_y)
+                    loss = self.loss_fn(pred, target)
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.encoder.parameters()) +
+                        list(self.controller.parameters()),
+                        max_norm=1.0
+                    )
+                    self.optimizer.step()
+
+                    total_loss += loss.item()
+                    sum_ae += (pred - target).abs().sum().item()
+                    total += target.size(0)
+
+                    self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
+                    self.global_step += 1
+
+                    mae = sum_ae / total
+                    pbar.set_postfix({"loss": f"{loss.item():.4f}", "mae": f"{mae:.3f}"})
+
+                self.writer.add_scalar("train/mae", sum_ae / total, self.current_epoch)
+
+        elif self.multi_param:
             correct_depth = 0
             correct_rate = 0
             correct_both = 0
@@ -171,7 +253,80 @@ class TapeIdentificationTrainer:
 
         total_loss = 0.0
 
-        if self.multi_param:
+        if self.regression:
+            if self.multi_param:
+                sum_ae_d = 0.0
+                sum_ae_r = 0.0
+                sum_se_d = 0.0
+                sum_se_r = 0.0
+                total = 0
+
+                for y, target_d, target_r in tqdm(self.val_loader, desc="Validation"):
+                    y = y.to(self.device)
+                    target_d = target_d.to(self.device).unsqueeze(1)
+                    target_r = target_r.to(self.device).unsqueeze(1)
+
+                    e_y = self.encoder(y)
+                    pred = self.controller(e_y)
+
+                    loss_d = self.loss_fn(pred["depth"], target_d)
+                    loss_r = self.loss_fn(pred["rate"], target_r)
+                    loss = loss_d + loss_r
+                    total_loss += loss.item()
+
+                    diff_d = pred["depth"] - target_d
+                    diff_r = pred["rate"] - target_r
+                    sum_ae_d += diff_d.abs().sum().item()
+                    sum_ae_r += diff_r.abs().sum().item()
+                    sum_se_d += (diff_d ** 2).sum().item()
+                    sum_se_r += (diff_r ** 2).sum().item()
+                    total += target_d.size(0)
+
+                avg_loss = total_loss / len(self.val_loader)
+                mae_d = sum_ae_d / total
+                mae_r = sum_ae_r / total
+                rmse_d = math.sqrt(sum_se_d / total)
+                rmse_r = math.sqrt(sum_se_r / total)
+
+                self.writer.add_scalar("val/loss", avg_loss, self.current_epoch)
+                self.writer.add_scalar("val/mae_depth", mae_d, self.current_epoch)
+                self.writer.add_scalar("val/mae_rate", mae_r, self.current_epoch)
+                self.writer.add_scalar("val/rmse_depth", rmse_d, self.current_epoch)
+                self.writer.add_scalar("val/rmse_rate", rmse_r, self.current_epoch)
+
+                print(f"  val MAE: depth={mae_d:.4f}, rate={mae_r:.4f} | RMSE: depth={rmse_d:.4f}, rate={rmse_r:.4f}")
+
+            else:
+                sum_ae = 0.0
+                sum_se = 0.0
+                total = 0
+
+                for y, target in tqdm(self.val_loader, desc="Validation"):
+                    y = y.to(self.device)
+                    target = target.to(self.device).unsqueeze(1)
+
+                    e_y = self.encoder(y)
+                    pred = self.controller(e_y)
+
+                    loss = self.loss_fn(pred, target)
+                    total_loss += loss.item()
+
+                    diff = pred - target
+                    sum_ae += diff.abs().sum().item()
+                    sum_se += (diff ** 2).sum().item()
+                    total += target.size(0)
+
+                avg_loss = total_loss / len(self.val_loader)
+                mae = sum_ae / total
+                rmse = math.sqrt(sum_se / total)
+
+                self.writer.add_scalar("val/loss", avg_loss, self.current_epoch)
+                self.writer.add_scalar("val/mae", mae, self.current_epoch)
+                self.writer.add_scalar("val/rmse", rmse, self.current_epoch)
+
+                print(f"  val MAE={mae:.4f}, RMSE={rmse:.4f}")
+
+        elif self.multi_param:
             correct_depth = 0
             correct_rate = 0
             correct_both = 0
@@ -279,7 +434,12 @@ class TapeIdentificationTrainer:
 
     def train(self, num_epochs: int, resume_from: Optional[str] = None):
         """Ejecuta loop de entrenamiento completo."""
-        mode = "multi-param (depth + rate)" if self.multi_param else "single-param"
+        if self.regression:
+            mode = "regression multi-param" if self.multi_param else "regression"
+        elif self.multi_param:
+            mode = "classification multi-param"
+        else:
+            mode = "classification"
         print(f"Starting training for {num_epochs} epochs [{mode}]")
         print(f"Device: {self.device}")
         print(f"Train batches: {len(self.train_loader)}")
@@ -318,13 +478,18 @@ class TapeIdentificationTrainer:
                     if self.scheduler:
                         self.scheduler.step(val_loss)
 
-                    # Check for best model
+                    # Check for best model + early stopping
                     if val_loss < self.best_val_loss - self.min_delta:
                         self.best_val_loss = val_loss
+                        self.patience_counter = 0
                         self.save_checkpoint(is_best=True)
                         print(f"New best model! val_loss={val_loss:.4f}")
                     else:
-                        print(f"No improvement (best: {self.best_val_loss:.4f})")
+                        self.patience_counter += 1
+                        print(f"No improvement (best: {self.best_val_loss:.4f}, patience: {self.patience_counter}/{self.patience})")
+                        if self.patience_counter >= self.patience:
+                            print(f"Early stopping triggered after {self.patience} epochs without improvement")
+                            break
 
                 except Exception as e:
                     logging.error(f"Error in epoch {epoch}: {str(e)}")

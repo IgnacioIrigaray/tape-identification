@@ -10,19 +10,22 @@ import torch.nn as nn
 
 class ParameterController(nn.Module):
     """
-    Controlador que predice clases de parámetros desde un embedding de audio.
+    Controlador que predice parámetros desde un embedding de audio.
 
-    Soporta modo single-param (backward compat) y multi-param (dual head).
+    Soporta clasificación y regresión, single-param y multi-param.
 
-    Single-param: retorna tensor [batch, num_classes]
-    Multi-param:  retorna dict {"depth": [batch, N_d], "rate": [batch, N_r]}
+    Clasificación single-param: retorna tensor [batch, num_classes]
+    Clasificación multi-param:  retorna dict {"depth": [batch, N_d], "rate": [batch, N_r]}
+    Regresión single-param:     retorna tensor [batch, 1] en [0, 1]
+    Regresión multi-param:      retorna dict {"depth": [batch, 1], "rate": [batch, 1]}
 
     Args:
-        num_classes: Número de clases (modo single-param)
+        num_classes: Número de clases (modo clasificación single-param)
         embed_dim: Dimensión de los embeddings del encoder
         hidden_dim: Dimensión oculta del MLP
-        num_classes_depth: Clases para depth (modo multi-param)
-        num_classes_rate: Clases para rate (modo multi-param)
+        num_classes_depth: Clases para depth (modo clasificación multi-param)
+        num_classes_rate: Clases para rate (modo clasificación multi-param)
+        regression: Si True, predice valores continuos en [0, 1]
     """
 
     def __init__(
@@ -32,10 +35,12 @@ class ParameterController(nn.Module):
         hidden_dim: int = 256,
         num_classes_depth: int = None,
         num_classes_rate: int = None,
+        regression: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
+        self.regression = regression
         self.multi_param = (num_classes_depth is not None and num_classes_rate is not None)
 
         if self.multi_param:
@@ -49,19 +54,35 @@ class ParameterController(nn.Module):
                 nn.LeakyReLU(0.01),
                 nn.Dropout(0.3),
             )
-            self.head_depth = nn.Linear(hidden_dim, num_classes_depth)
-            self.head_rate = nn.Linear(hidden_dim, num_classes_rate)
+            if regression:
+                self.head_depth = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
+                self.head_rate = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
+            else:
+                self.head_depth = nn.Linear(hidden_dim, num_classes_depth)
+                self.head_rate = nn.Linear(hidden_dim, num_classes_rate)
         else:
             self.num_classes = num_classes
-            self.mlp = nn.Sequential(
-                nn.Linear(embed_dim, hidden_dim),
-                nn.LeakyReLU(0.01),
-                nn.Dropout(0.3),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.LeakyReLU(0.01),
-                nn.Dropout(0.3),
-                nn.Linear(hidden_dim, num_classes),
-            )
+            if regression:
+                self.mlp = nn.Sequential(
+                    nn.Linear(embed_dim, hidden_dim),
+                    nn.LeakyReLU(0.01),
+                    nn.Dropout(0.3),
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.LeakyReLU(0.01),
+                    nn.Dropout(0.3),
+                    nn.Linear(hidden_dim, 1),
+                    nn.Sigmoid(),
+                )
+            else:
+                self.mlp = nn.Sequential(
+                    nn.Linear(embed_dim, hidden_dim),
+                    nn.LeakyReLU(0.01),
+                    nn.Dropout(0.3),
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.LeakyReLU(0.01),
+                    nn.Dropout(0.3),
+                    nn.Linear(hidden_dim, num_classes),
+                )
 
     def forward(self, e_y: torch.Tensor):
         if self.multi_param:

@@ -2,8 +2,8 @@
 Script de evaluación sobre el split de test.
 
 Usa la misma lógica de split determinista que el dataset (seed=42, train_frac=0.8)
-para obtener el 10% de archivos de test, aplica la degradación con una clase al azar,
-y evalúa el modelo.
+para obtener el 10% de archivos de test, aplica la degradación con un parámetro
+aleatorio, y evalúa el modelo.
 """
 
 import sys
@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
 import glob
+import math
 import random
 import torch
 import torchaudio
@@ -28,7 +29,8 @@ from tape_id.utils import split_dataset, conform_length, linear_fade
 
 def load_model(checkpoint_path: str, device: str = "cpu", num_classes: int = 10,
                sample_rate: int = 22050, multi_param: bool = False,
-               num_classes_depth: int = 3, num_classes_rate: int = 3):
+               num_classes_depth: int = 3, num_classes_rate: int = 3,
+               regression: bool = False):
     """Carga modelo desde checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
@@ -39,9 +41,13 @@ def load_model(checkpoint_path: str, device: str = "cpu", num_classes: int = 10,
             embed_dim=1024, hidden_dim=256,
             num_classes_depth=num_classes_depth,
             num_classes_rate=num_classes_rate,
+            regression=regression,
         ).to(device)
     else:
-        controller = ParameterController(num_classes=num_classes, embed_dim=1024, hidden_dim=256).to(device)
+        controller = ParameterController(
+            num_classes=num_classes, embed_dim=1024, hidden_dim=256,
+            regression=regression,
+        ).to(device)
 
     encoder.load_state_dict(checkpoint["encoder_state"])
     controller.load_state_dict(checkpoint["controller_state"])
@@ -91,6 +97,23 @@ def apply_degradation(x, param, args, wow_rate_override=None):
         return tape_saturation(x, param)
 
 
+def _load_and_prepare_audio(fpath, sample_rate, audio_length):
+    """Carga un archivo de audio y lo prepara para evaluación."""
+    audio, sr = torchaudio.load(fpath)
+    if sr != sample_rate:
+        audio = torchaudio.transforms.Resample(sr, sample_rate)(audio)
+    if audio.shape[0] > 1:
+        audio = audio.mean(dim=0)
+    else:
+        audio = audio.squeeze(0)
+
+    if audio.shape[0] > audio_length:
+        audio = audio[:audio_length]
+
+    audio = audio / (audio.abs().max() + 1e-8)
+    return audio
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate on test split")
     parser.add_argument("--checkpoint", type=str, required=True)
@@ -124,6 +147,9 @@ def main():
     parser.add_argument("--max_depth", type=float, default=0.8)
     parser.add_argument("--min_rate", type=float, default=0.1)
     parser.add_argument("--max_rate", type=float, default=0.8)
+    # Regression
+    parser.add_argument("--regression", action="store_true", help="Regression mode (continuous param)")
+    parser.add_argument("--num_eval_points", type=int, default=20, help="Number of eval points for regression")
     args = parser.parse_args()
 
     if args.no_ou:
@@ -134,9 +160,12 @@ def main():
         args.multi_param = True
 
     device = args.device
+    mode = "regression" if args.regression else "classification"
+    if args.multi_param:
+        mode += " multi-param"
     print(f"Device: {device}")
     print(f"Degradation: {args.degradation_model}")
-    print(f"Mode: {'multi-param (depth+rate)' if args.multi_param else 'single-param'}")
+    print(f"Mode: {mode}")
 
     # Cargar modelo
     encoder, controller, epoch = load_model(
@@ -144,6 +173,7 @@ def main():
         multi_param=args.multi_param,
         num_classes_depth=args.num_classes_depth,
         num_classes_rate=args.num_classes_rate,
+        regression=args.regression,
     )
     print(f"Model loaded (epoch {epoch})")
 
@@ -158,14 +188,102 @@ def main():
     sample_rate = args.sample_rate
     audio_length = args.audio_length
 
-    if args.multi_param:
+    if args.regression:
+        _evaluate_regression(encoder, controller, test_files, args, device, sample_rate, audio_length)
+    elif args.multi_param:
         _evaluate_multi_param(encoder, controller, test_files, args, device, sample_rate, audio_length)
     else:
         _evaluate_single_param(encoder, controller, test_files, args, device, sample_rate, audio_length)
 
 
+# ---------------------------------------------------------------------------
+# Regression evaluation
+# ---------------------------------------------------------------------------
+
+def _evaluate_regression(encoder, controller, test_files, args, device, sample_rate, audio_length):
+    """Evaluación en modo regresión: predice valor continuo del parámetro."""
+    min_p = args.min_gain
+    max_p = args.max_gain
+    param_range = max_p - min_p
+
+    all_true = []
+    all_pred = []
+
+    pbar = tqdm(test_files, ncols=80)
+    for fpath in pbar:
+        audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
+
+        # Muestrear parámetro uniforme
+        param = random.uniform(min_p, max_p)
+
+        x = audio.unsqueeze(0)
+        audio_deg = apply_degradation(x, param, args)
+        audio_deg = conform_length(audio_deg, audio_length)
+        audio_deg = linear_fade(audio_deg, sample_rate=sample_rate)
+
+        y = audio_deg.unsqueeze(0).to(device)
+        with torch.no_grad():
+            e_y = encoder(y)
+            pred_norm = controller(e_y).item()
+
+        pred_param = pred_norm * param_range + min_p
+        all_true.append(param)
+        all_pred.append(pred_param)
+
+        if len(all_true) > 1:
+            mae_so_far = np.mean(np.abs(np.array(all_true) - np.array(all_pred)))
+            pbar.set_postfix(mae=f"{mae_so_far:.3f}")
+
+    true_arr = np.array(all_true)
+    pred_arr = np.array(all_pred)
+    errors = pred_arr - true_arr
+    abs_errors = np.abs(errors)
+
+    mae = np.mean(abs_errors)
+    rmse = math.sqrt(np.mean(errors ** 2))
+    # R²
+    ss_res = np.sum(errors ** 2)
+    ss_tot = np.sum((true_arr - np.mean(true_arr)) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    print("=" * 60)
+    print(f"Regression results ({len(all_true)} samples)")
+    print(f"  Param range: [{min_p:.3f}, {max_p:.3f}]")
+    print(f"  MAE:  {mae:.4f}")
+    print(f"  RMSE: {rmse:.4f}")
+    print(f"  R²:   {r2:.4f}")
+    print(f"  Max error: {np.max(abs_errors):.4f}")
+    print(f"  Median error: {np.median(abs_errors):.4f}")
+
+    # Error por rango (bins)
+    num_bins = min(5, args.num_eval_points)
+    bin_edges = np.linspace(min_p, max_p, num_bins + 1)
+    print(f"\nError por rango:")
+    print(f"  {'Rango':>20}  {'N':>5}  {'MAE':>8}  {'RMSE':>8}")
+    for i in range(num_bins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        mask = (true_arr >= lo) & (true_arr < hi if i < num_bins - 1 else true_arr <= hi)
+        n = mask.sum()
+        if n > 0:
+            bin_mae = np.mean(abs_errors[mask])
+            bin_rmse = math.sqrt(np.mean(errors[mask] ** 2))
+            print(f"  [{lo:6.3f}, {hi:6.3f}]  {n:5d}  {bin_mae:8.4f}  {bin_rmse:8.4f}")
+        else:
+            print(f"  [{lo:6.3f}, {hi:6.3f}]  {n:5d}       -         -")
+
+    # Scatter text (top 20 samples)
+    print(f"\nSample predictions (first 20):")
+    print(f"  {'True':>8}  {'Pred':>8}  {'Error':>8}")
+    for i in range(min(20, len(all_true))):
+        print(f"  {all_true[i]:8.3f}  {all_pred[i]:8.3f}  {errors[i]:+8.3f}")
+
+
+# ---------------------------------------------------------------------------
+# Classification evaluation (single-param)
+# ---------------------------------------------------------------------------
+
 def _evaluate_single_param(encoder, controller, test_files, args, device, sample_rate, audio_length):
-    """Evaluación single-param (backward compat)."""
+    """Evaluación single-param clasificación."""
     if args.log_scale:
         param_values = torch.tensor(np.geomspace(args.min_gain, args.max_gain, args.num_classes), dtype=torch.float32)
     else:
@@ -180,18 +298,7 @@ def _evaluate_single_param(encoder, controller, test_files, args, device, sample
 
     pbar = tqdm(test_files, ncols=80)
     for fpath in pbar:
-        audio, sr = torchaudio.load(fpath)
-        if sr != sample_rate:
-            audio = torchaudio.transforms.Resample(sr, sample_rate)(audio)
-        if audio.shape[0] > 1:
-            audio = audio.mean(dim=0)
-        else:
-            audio = audio.squeeze(0)
-
-        if audio.shape[0] > audio_length:
-            audio = audio[:audio_length]
-
-        audio = audio / (audio.abs().max() + 1e-8)
+        audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
 
         class_idx = random.randint(0, num_classes - 1)
         param = param_values[class_idx].item()
@@ -233,6 +340,10 @@ def _evaluate_single_param(encoder, controller, test_files, args, device, sample
         print(f"{'p=' + param_labels[i]:>10}{row}")
 
 
+# ---------------------------------------------------------------------------
+# Classification evaluation (multi-param)
+# ---------------------------------------------------------------------------
+
 def _evaluate_multi_param(encoder, controller, test_files, args, device, sample_rate, audio_length):
     """Evaluación dual-param: depth + rate."""
     nc_d = args.num_classes_depth
@@ -254,18 +365,7 @@ def _evaluate_multi_param(encoder, controller, test_files, args, device, sample_
 
     pbar = tqdm(test_files, ncols=80)
     for fpath in pbar:
-        audio, sr = torchaudio.load(fpath)
-        if sr != sample_rate:
-            audio = torchaudio.transforms.Resample(sr, sample_rate)(audio)
-        if audio.shape[0] > 1:
-            audio = audio.mean(dim=0)
-        else:
-            audio = audio.squeeze(0)
-
-        if audio.shape[0] > audio_length:
-            audio = audio[:audio_length]
-
-        audio = audio / (audio.abs().max() + 1e-8)
+        audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
 
         depth_idx = random.randint(0, nc_d - 1)
         rate_idx = random.randint(0, nc_r - 1)

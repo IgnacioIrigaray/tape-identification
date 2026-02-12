@@ -145,6 +145,57 @@ def test_wow_flutter_lagrange3():
     print("✓ Wow/flutter lagrange3 OK")
 
 
+def test_controller_regression():
+    """Test controller regression mode: output [batch, 1] in [0, 1]."""
+    print("Testing ParameterController regression...")
+    controller = ParameterController(num_classes=3, embed_dim=128, regression=True)
+    assert controller.regression is True
+    e_y = torch.randn(4, 128)
+    out = controller(e_y)
+    assert out.shape == (4, 1), f"Expected (4, 1), got {out.shape}"
+    assert (out >= 0).all() and (out <= 1).all(), f"Sigmoid output should be in [0,1], got min={out.min():.4f} max={out.max():.4f}"
+    print("✓ Controller regression OK")
+
+
+def test_controller_regression_multi():
+    """Test controller regression multi-param: dict output with [batch, 1] values."""
+    print("Testing ParameterController regression multi-param...")
+    controller = ParameterController(
+        embed_dim=128, hidden_dim=64,
+        num_classes_depth=3, num_classes_rate=3,
+        regression=True,
+    )
+    assert controller.regression is True
+    assert controller.multi_param is True
+    e_y = torch.randn(4, 128)
+    out = controller(e_y)
+    assert isinstance(out, dict), f"Expected dict, got {type(out)}"
+    assert out["depth"].shape == (4, 1), f"Expected (4, 1), got {out['depth'].shape}"
+    assert out["rate"].shape == (4, 1), f"Expected (4, 1), got {out['rate'].shape}"
+    assert (out["depth"] >= 0).all() and (out["depth"] <= 1).all()
+    assert (out["rate"] >= 0).all() and (out["rate"] <= 1).all()
+    print("✓ Controller regression multi-param OK")
+
+
+def test_full_pipeline_regression():
+    """Test full pipeline with regression: encoder -> controller -> MSE loss."""
+    print("Testing full pipeline regression...")
+    encoder = SpectralEncoder(num_params=1, sample_rate=22050, embed_dim=128, width_mult=2)
+    controller = ParameterController(num_classes=3, embed_dim=128, regression=True)
+
+    y = torch.randn(2, 1, 22050)
+    e_y = encoder(y)
+    pred = controller(e_y)
+
+    assert pred.shape == (2, 1)
+
+    target = torch.rand(2, 1)
+    loss = torch.nn.functional.mse_loss(pred, target)
+    assert loss.item() >= 0, "MSE loss should be non-negative"
+    loss.backward()
+    print("✓ Full pipeline regression OK")
+
+
 if __name__ == "__main__":
     print("Running tests...\n")
     test_encoder()
@@ -157,4 +208,7 @@ if __name__ == "__main__":
     test_wow_flutter_basic()
     test_wow_flutter_bypass()
     test_wow_flutter_lagrange3()
+    test_controller_regression()
+    test_controller_regression_multi()
+    test_full_pipeline_regression()
     print("\n✅ All tests passed!")

@@ -405,6 +405,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         log_scale: bool = True,
         ext: str = "mp3",
         sample_rate: int = None,
+        regression: bool = False,
         # Aliases para compatibilidad
         min_gain: float = None,
         max_gain: float = None,
@@ -424,6 +425,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         self.degradation_model = degradation_model
         self.log_scale = log_scale
         self.ext = ext
+        self.regression = regression
 
         # Compatibilidad con parámetros antiguos
         if min_gain is not None:
@@ -464,16 +466,20 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
                 kwargs.get("max_rate", max_param),
                 self.num_classes_rate,
             ))
-            print(f"Wow/Flutter DUAL param mode:")
-            print(f"  Depth values ({self.num_classes_depth} classes): {[f'{p:.3f}' for p in self.depth_values]}")
-            print(f"  Rate values ({self.num_classes_rate} classes): {[f'{p:.3f}' for p in self.rate_values]}")
+            mode = "REGRESSION" if regression else f"{self.num_classes_depth}x{self.num_classes_rate} classes"
+            print(f"Wow/Flutter DUAL param mode ({mode}):")
+            print(f"  Depth range: [{self.depth_values[0]:.3f}, {self.depth_values[-1]:.3f}]")
+            print(f"  Rate range: [{self.rate_values[0]:.3f}, {self.rate_values[-1]:.3f}]")
         else:
             model_names = {
                 "ja": "Jiles-Atherton", "tanh": "tanh",
                 "hard_clipping": "Hard Clipping", "wow_flutter": "Wow/Flutter",
             }
             model_name = model_names.get(degradation_model, degradation_model)
-            print(f"{model_name} param values ({num_classes} classes): {[f'{p:.3f}' for p in self.param_values]}")
+            if regression:
+                print(f"{model_name} REGRESSION mode: param range [{min_param:.3f}, {max_param:.3f}]")
+            else:
+                print(f"{model_name} param values ({num_classes} classes): {[f'{p:.3f}' for p in self.param_values]}")
 
         # Buscar archivos de audio
         self.input_filepaths = []
@@ -612,21 +618,38 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         # Normalizar a 0 dBFS (amplitud máxima = 1.0)
         x = x / (x.abs().max() + 1e-8)
 
-        # Seleccionar clase(s) y aplicar degradación
+        # Seleccionar parámetro(s) y aplicar degradación
         if self.degradation_model == "wow_flutter" and self.wf_target_param == "both":
-            depth_idx = rng.randint(0, self.num_classes_depth - 1)
-            rate_idx = rng.randint(0, self.num_classes_rate - 1)
-            depth_val = self.depth_values[depth_idx]
-            rate_val = self.rate_values[rate_idx]
+            if self.regression:
+                min_d = self.depth_values[0]
+                max_d = self.depth_values[-1]
+                min_r = self.rate_values[0]
+                max_r = self.rate_values[-1]
+                depth_val = rng.uniform(min_d, max_d)
+                rate_val = rng.uniform(min_r, max_r)
+                depth_target = (depth_val - min_d) / (max_d - min_d)
+                rate_target = (rate_val - min_r) / (max_r - min_r)
+            else:
+                depth_idx = rng.randint(0, self.num_classes_depth - 1)
+                rate_idx = rng.randint(0, self.num_classes_rate - 1)
+                depth_val = self.depth_values[depth_idx]
+                rate_val = self.rate_values[rate_idx]
             y = wow_flutter(x, depth_val, sample_rate=self.sample_rate,
                             wow_rate=rate_val, flutter_rate=self.flutter_rate,
                             enable_ou=self.enable_ou, interpolation=self.wf_interpolation)
             y = utils.conform_length(y, self.length)
             y = utils.linear_fade(y, sample_rate=self.sample_rate)
+            if self.regression:
+                return y, torch.tensor(depth_target, dtype=torch.float32), torch.tensor(rate_target, dtype=torch.float32)
             return y, depth_idx, rate_idx
 
-        class_idx = rng.randint(0, self.num_classes - 1)
-        param = self.param_values[class_idx]
+        if self.regression:
+            param = rng.uniform(self.min_param, self.max_param)
+            target = (param - self.min_param) / (self.max_param - self.min_param)
+        else:
+            class_idx = rng.randint(0, self.num_classes - 1)
+            param = self.param_values[class_idx]
+
         if self.degradation_model == "ja":
             y = ja_saturation(x, param, sample_rate=self.sample_rate)
         elif self.degradation_model == "hard_clipping":
@@ -645,4 +668,6 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
 
         y = utils.conform_length(y, self.length)
         y = utils.linear_fade(y, sample_rate=self.sample_rate)
+        if self.regression:
+            return y, torch.tensor(target, dtype=torch.float32)
         return y, class_idx
