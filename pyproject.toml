@@ -1,0 +1,33 @@
+[project]
+name = "tape-id"
+version = "0.1.0"
+description = "Deep learning model for identifying tape saturation parameters from audio"
+license = "BSD-3-Clause"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "torchvision>=0.15.0",
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "tqdm>=4.65.0",
+    "tensorboard>=2.13.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "matplotlib>=3.7.0",
+    "pyyaml>=6.0",
+    "numba",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tape_id*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,8 +1,7 @@
 """
-Tape Saturation Processor - Modelo diferenciable de saturación tipo tape.
+Tape Saturation Processors - Differentiable audio processors with discrete classification.
 
-Este módulo implementa un procesador de saturación simple usando tanh.
-Soporta clasificación discreta con N clases.
+Includes: TapeSaturationProcessor (tanh), JilesAthertonProcessor, HardClippingProcessor.
 """
 
 import torch
@@ -10,325 +9,148 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class TapeSaturationProcessor(nn.Module):
-    """
-    Procesador de saturación tipo tape diferenciable con N clases discretas.
+def straight_through_select(logits: torch.Tensor, values: torch.Tensor,
+                            num_classes: int, use_argmax: bool = False) -> torch.Tensor:
+    """Select a value from discrete options using straight-through estimator.
+
+    During training (use_argmax=False): forward uses argmax, backward uses softmax gradients.
+    During inference (use_argmax=True): pure argmax selection.
 
     Args:
-        min_gain: Ganancia mínima (default: 1.0)
-        max_gain: Ganancia máxima (default: 10.0)
-        num_classes: Número de clases discretas (default: 10)
+        logits: Classification logits [batch, num_classes]
+        values: Value for each class [num_classes]
+        num_classes: Number of discrete classes
+        use_argmax: If True, use pure argmax (no gradient flow)
+
+    Returns:
+        Selected values [batch]
+    """
+    if use_argmax:
+        return values[torch.argmax(logits, dim=-1)]
+
+    probs = F.softmax(logits, dim=-1)
+    hard = F.one_hot(probs.argmax(-1), num_classes).float()
+    probs_st = probs + (hard - probs).detach()
+    return (probs_st * values).sum(dim=-1)
+
+
+def gain_from_logits(logits: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """Get discrete gain value from logits (for logging/inference).
+
+    Args:
+        logits: Classification logits [batch, num_classes]
+        values: Gain value for each class [num_classes]
+
+    Returns:
+        Selected gain values [batch]
+    """
+    return values[torch.argmax(logits, dim=-1)]
+
+
+class TapeSaturationProcessor(nn.Module):
+    """Differentiable tanh saturation with N discrete gain classes.
+
+    y = tanh(x * gain)
+
+    Args:
+        min_gain: Minimum gain value
+        max_gain: Maximum gain value
+        num_classes: Number of discrete classes
     """
 
-    def __init__(
-        self,
-        min_gain: float = 1.0,
-        max_gain: float = 10.0,
-        num_classes: int = 10,
-    ):
+    def __init__(self, min_gain=1.0, max_gain=10.0, num_classes=10):
         super().__init__()
-        self.min_gain = min_gain
-        self.max_gain = max_gain
         self.num_classes = num_classes
+        self.register_buffer('gain_values', torch.linspace(min_gain, max_gain, num_classes))
 
-        # Valores de gain para cada clase (buffer para que se mueva con el modelo)
-        gain_values = torch.linspace(min_gain, max_gain, num_classes)
-        self.register_buffer('gain_values', gain_values)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        logits: torch.Tensor,
-        use_argmax: bool = False,
-    ) -> torch.Tensor:
-        """
-        Aplica saturación con clasificación discreta.
-
-        Args:
-            x: Audio tensor [batch, channels, samples]
-            logits: Logits de clasificación [batch, num_classes]
-            use_argmax: Si True, usa argmax puro (inferencia).
-                        Si False, usa straight-through estimator (training).
-
-        Returns:
-            Audio saturado [batch, channels, samples]
-        """
-        if use_argmax:
-            # Inferencia: valor discreto exacto
-            class_idx = torch.argmax(logits, dim=-1)  # [batch]
-            gain = self.gain_values[class_idx]  # [batch]
-        else:
-            # Training: Straight-through estimator
-            # Forward: usa valor discreto (argmax)
-            # Backward: gradientes fluyen a través de softmax
-            probs = F.softmax(logits, dim=-1)  # [batch, num_classes]
-
-            # One-hot del argmax
-            hard = F.one_hot(probs.argmax(-1), self.num_classes).float()
-
-            # Straight-through: forward usa hard, backward usa probs
-            probs_st = probs + (hard - probs).detach()
-
-            gain = (probs_st * self.gain_values).sum(dim=-1)  # [batch]
-
-        # Expandir para broadcasting: [batch] -> [batch, 1, 1]
+    def forward(self, x, logits, use_argmax=False):
+        gain = straight_through_select(logits, self.gain_values, self.num_classes, use_argmax)
         gain = gain.unsqueeze(-1).unsqueeze(-1)
+        return torch.tanh(x * gain)
 
-        # Aplicar saturación
-        saturated = torch.tanh(x * gain)
-
-        return saturated
-
-    def get_gain_from_logits(
-        self,
-        logits: torch.Tensor,
-        use_argmax: bool = False,
-    ) -> torch.Tensor:
-        """
-        Obtiene el valor de gain desde logits (para logging).
-
-        Args:
-            use_argmax: Si True, usa argmax. Si False, usa straight-through
-                        (que en forward da el mismo resultado que argmax).
-
-        Returns:
-            gain: [batch] valores de gain
-        """
-        # Con straight-through, training y inference dan el mismo valor discreto
-        class_idx = torch.argmax(logits, dim=-1)
-        return self.gain_values[class_idx]
+    def get_gain_from_logits(self, logits):
+        return gain_from_logits(logits, self.gain_values)
 
 
 def apply_tape_saturation(x: torch.Tensor, gain: float) -> torch.Tensor:
-    """
-    Función helper para aplicar saturación con gain específico.
-
-    Args:
-        x: Audio tensor
-        gain: Ganancia de saturación [1, 10]
-
-    Returns:
-        Audio saturado
-    """
+    """Apply tanh saturation: y = tanh(x * gain)."""
     return torch.tanh(x * gain)
 
 
 def langevin(x: torch.Tensor) -> torch.Tensor:
-    """
-    Función de Langevin: L(x) = coth(x) - 1/x
+    """Langevin function: L(x) = coth(x) - 1/x.
 
-    Es la función que describe la magnetización anhisterética en el modelo
-    Jiles-Atherton. Para x pequeño: L(x) ≈ x/3
+    Describes anhysteretic magnetization in Jiles-Atherton model.
+    For small x: L(x) ~ x/3 (Taylor approximation).
     """
     small = torch.abs(x) < 0.01
     result = torch.zeros_like(x)
-
-    # Aproximación Taylor para valores pequeños
     result[small] = x[small] / 3.0
-
-    # Fórmula exacta para valores grandes
     large = ~small
     x_large = x[large]
     result[large] = 1.0 / torch.tanh(x_large) - 1.0 / x_large
-
     return result
 
 
 def apply_ja_saturation(x: torch.Tensor, gain: float) -> torch.Tensor:
-    """
-    Aplica saturación usando modelo Jiles-Atherton normalizado.
-
-    Internamente usa: y = 3a * L(x/a) donde a = 1/gain
-
-    Args:
-        x: Audio tensor
-        gain: Ganancia (gain alto = más saturación, gain bajo = bypass)
-
-    Returns:
-        Audio saturado
-    """
+    """Apply Jiles-Atherton anhysteretic saturation: y = 3a * L(x/a) where a = 1/gain."""
     a = 1.0 / gain
     return 3.0 * a * langevin(x / a)
 
 
 class JilesAthertonProcessor(nn.Module):
-    """
-    Procesador de saturación basado en el modelo Jiles-Atherton.
+    """Jiles-Atherton anhysteretic saturation with N discrete gain classes.
 
-    Usa la curva anhisterética de magnetización para simular saturación
-    de cinta magnética de forma más realista que tanh.
-
-    Fórmula interna: y = 3a * L(x/a) donde L(x) = coth(x) - 1/x
-    Pero externamente usa 'gain' donde: a = 1/gain
-
-    Así: gain alto = más saturación (como tanh tradicional)
+    Uses the anhysteretic magnetization curve for more realistic tape saturation.
+    y = 3a * L(x/a) where L is the Langevin function, a = 1/gain.
 
     Args:
-        min_gain: Ganancia mínima (menos saturación)
-        max_gain: Ganancia máxima (más saturación)
-        num_classes: Número de clases discretas
+        min_gain: Minimum gain (less saturation)
+        max_gain: Maximum gain (more saturation)
+        num_classes: Number of discrete classes
     """
 
-    def __init__(
-        self,
-        min_gain: float = 2.0,
-        max_gain: float = 5.0,
-        num_classes: int = 3,
-    ):
+    def __init__(self, min_gain=2.0, max_gain=5.0, num_classes=3):
         super().__init__()
-        self.min_gain = min_gain
-        self.max_gain = max_gain
         self.num_classes = num_classes
+        self.register_buffer('gain_values', torch.linspace(min_gain, max_gain, num_classes))
 
-        # Valores de gain para cada clase (escala lineal)
-        gain_values = torch.linspace(min_gain, max_gain, num_classes)
-        self.register_buffer('gain_values', gain_values)
-
-    def _langevin(self, x: torch.Tensor) -> torch.Tensor:
-        """Función de Langevin vectorizada."""
-        small = torch.abs(x) < 0.01
-        result = torch.zeros_like(x)
-        result[small] = x[small] / 3.0
-        large = ~small
-        x_large = x[large]
-        result[large] = 1.0 / torch.tanh(x_large) - 1.0 / x_large
-        return result
-
-    def _apply_saturation(self, x: torch.Tensor, gain: torch.Tensor) -> torch.Tensor:
-        """Aplica saturación JA con gain (internamente a = 1/gain)."""
-        # gain tiene shape [batch, 1, 1], x tiene shape [batch, channels, samples]
-        a = 1.0 / gain
-        return 3.0 * a * self._langevin(x / a)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        logits: torch.Tensor,
-        use_argmax: bool = False,
-    ) -> torch.Tensor:
-        """
-        Aplica saturación Jiles-Atherton con clasificación discreta.
-
-        Args:
-            x: Audio tensor [batch, channels, samples]
-            logits: Logits de clasificación [batch, num_classes]
-            use_argmax: Si True, usa argmax (inferencia). Si False, straight-through.
-
-        Returns:
-            Audio saturado [batch, channels, samples]
-        """
-        if use_argmax:
-            class_idx = torch.argmax(logits, dim=-1)
-            gain = self.gain_values[class_idx]
-        else:
-            # Straight-through estimator
-            probs = F.softmax(logits, dim=-1)
-            hard = F.one_hot(probs.argmax(-1), self.num_classes).float()
-            probs_st = probs + (hard - probs).detach()
-            gain = (probs_st * self.gain_values).sum(dim=-1)
-
-        # Expandir: [batch] -> [batch, 1, 1]
+    def forward(self, x, logits, use_argmax=False):
+        gain = straight_through_select(logits, self.gain_values, self.num_classes, use_argmax)
         gain = gain.unsqueeze(-1).unsqueeze(-1)
+        a = 1.0 / gain
+        return 3.0 * a * langevin(x / a)
 
-        return self._apply_saturation(x, gain)
-
-    def get_gain_from_logits(
-        self,
-        logits: torch.Tensor,
-        use_argmax: bool = False,
-    ) -> torch.Tensor:
-        """Obtiene el valor de gain desde logits (para logging)."""
-        class_idx = torch.argmax(logits, dim=-1)
-        return self.gain_values[class_idx]
+    def get_gain_from_logits(self, logits):
+        return gain_from_logits(logits, self.gain_values)
 
 
 def apply_hard_clipping(x: torch.Tensor, gain: float) -> torch.Tensor:
-    """
-    Aplica hard clipping con ganancia.
-
-    Fórmula: y = clamp(x * gain, -1, 1)
-
-    Args:
-        x: Audio tensor
-        gain: Ganancia antes del clipping (gain > 1 produce clipping)
-
-    Returns:
-        Audio con hard clipping aplicado
-    """
+    """Apply hard clipping: y = clamp(x * gain, -1, 1)."""
     return torch.clamp(x * gain, -1.0, 1.0)
 
 
 class HardClippingProcessor(nn.Module):
-    """
-    Procesador de hard clipping con clasificación discreta.
+    """Hard clipping with N discrete gain classes.
 
-    El modelo más simple de saturación/distorsión:
     y = clamp(x * gain, -1, 1)
-
-    Características:
-    - gain = 1.0: sin distorsión (bypass)
-    - gain > 1.0: los picos que excedan ±1/gain son recortados
-    - Diferencias muy marcadas entre valores de gain
+    gain = 1.0 is bypass, gain > 1.0 produces clipping.
 
     Args:
-        min_gain: Ganancia mínima (default: 1.0 = bypass)
-        max_gain: Ganancia máxima (default: 4.0 = clipping severo)
-        num_classes: Número de clases discretas
+        min_gain: Minimum gain (1.0 = bypass)
+        max_gain: Maximum gain
+        num_classes: Number of discrete classes
     """
 
-    def __init__(
-        self,
-        min_gain: float = 1.0,
-        max_gain: float = 4.0,
-        num_classes: int = 3,
-    ):
+    def __init__(self, min_gain=1.0, max_gain=4.0, num_classes=3):
         super().__init__()
-        self.min_gain = min_gain
-        self.max_gain = max_gain
         self.num_classes = num_classes
+        self.register_buffer('gain_values', torch.linspace(min_gain, max_gain, num_classes))
 
-        # Valores de gain para cada clase
-        gain_values = torch.linspace(min_gain, max_gain, num_classes)
-        self.register_buffer('gain_values', gain_values)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        logits: torch.Tensor,
-        use_argmax: bool = False,
-    ) -> torch.Tensor:
-        """
-        Aplica hard clipping con clasificación discreta.
-
-        Args:
-            x: Audio tensor [batch, channels, samples]
-            logits: Logits de clasificación [batch, num_classes]
-            use_argmax: Si True, usa argmax (inferencia). Si False, straight-through.
-
-        Returns:
-            Audio con hard clipping [batch, channels, samples]
-        """
-        if use_argmax:
-            class_idx = torch.argmax(logits, dim=-1)
-            gain = self.gain_values[class_idx]
-        else:
-            # Straight-through estimator
-            probs = F.softmax(logits, dim=-1)
-            hard = F.one_hot(probs.argmax(-1), self.num_classes).float()
-            probs_st = probs + (hard - probs).detach()
-            gain = (probs_st * self.gain_values).sum(dim=-1)
-
-        # Expandir: [batch] -> [batch, 1, 1]
+    def forward(self, x, logits, use_argmax=False):
+        gain = straight_through_select(logits, self.gain_values, self.num_classes, use_argmax)
         gain = gain.unsqueeze(-1).unsqueeze(-1)
-
-        # Hard clipping
         return torch.clamp(x * gain, -1.0, 1.0)
 
-    def get_gain_from_logits(
-        self,
-        logits: torch.Tensor,
-        use_argmax: bool = False,
-    ) -> torch.Tensor:
-        """Obtiene el valor de gain desde logits (para logging)."""
-        class_idx = torch.argmax(logits, dim=-1)
-        return self.gain_values[class_idx]
+    def get_gain_from_logits(self, logits):
+        return gain_from_logits(logits, self.gain_values)
