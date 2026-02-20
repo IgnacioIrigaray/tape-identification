@@ -5,23 +5,25 @@
 audio_dir: /mnt/data/working_datasets/jamendo
 # input_dirs: ["00", "01"] # optional: subset of subdirs (null = all)
 ext: mp3
+#audio_dir: /mnt/data/working_datasets/guitarset
+#ext: wav
 batch_size: 32
-num_workers: 0
+num_workers: 2
 sample_rate: 22050
 audio_length: 65536
 train_examples_per_epoch: 5000
 val_examples_per_epoch: 500
-buffer_size_gb: 3.5
+buffer_size_gb: 1
 buffer_reload_rate: 2000
 
 # Model
 embed_dim: 1024
 hidden_dim: 256
-degradation_model: ja_wf
+degradation_model: ja
 regression: true
 num_classes: 3
-min_param: 1.5
-max_param: 5.0
+min_param: 1.0
+max_param: 10.0
 
 # Triple-param ranges
 min_depth: 0.1
@@ -46,3 +48,11 @@ grad_clip_norm: 1.0
 # LR scheduler
 scheduler_factor: 0.5
 scheduler_patience: 5
+
+# Signal loss (audio reconstruction)
+# Set signal_loss_weight > 0 to enable (regression mode only)
+signal_loss_weight: 0.0
+param_loss_weight: 1.0
+signal_loss_fft_sizes: [1024, 2048, 8192]
+signal_loss_hop_sizes: [256, 512, 2048]
+signal_loss_win_lengths: [1024, 2048, 8192]

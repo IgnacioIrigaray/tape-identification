@@ -6,6 +6,7 @@ Generates pairs (y, target) where:
 - target = the parameter value (normalized to [0,1] for regression, class index for classification)
 """
 
+import gc
 import os
 import glob
 import math
@@ -190,33 +191,43 @@ ja_saturation = ja_hysteresis
 # Adapted from AnalogTapeModel (Jatin Chowdhury)
 # ---------------------------------------------------------------------------
 
+@numba.jit(nopython=True, cache=True)
+def _ou_kernel(noise, alpha, beta, gamma, ema_alpha):
+    """Numba kernel: OU process + EMA lowpass in a single pass."""
+    n = len(noise)
+    y = np.empty(n, dtype=np.float32)
+
+    # OU process
+    state = 0.0
+    for i in range(n):
+        state = alpha * state + beta * noise[i] + gamma
+        y[i] = state
+
+    # EMA lowpass
+    state = y[0]
+    for i in range(n):
+        state = state + ema_alpha * (y[i] - state)
+        y[i] = state
+
+    return y
+
+
 def _ornstein_uhlenbeck(num_samples: int, sample_rate: int,
                         amount: float = 0.2, damping: float = 5.0,
                         mean: float = 0.0) -> torch.Tensor:
     """Ornstein-Uhlenbeck process: random walk with mean-reversion + lowpass 10 Hz."""
     T = 1.0 / sample_rate
-    sqrt_delta = math.sqrt(2.0 * T)
     alpha = 1.0 - damping * T
-    beta = sqrt_delta * amount
+    beta = math.sqrt(2.0 * T) * amount
     gamma = damping * mean * T
 
-    noise = torch.randn(num_samples) / 2.33
-    y = torch.zeros(num_samples)
-    state = 0.0
-    for n in range(num_samples):
-        state = alpha * state + beta * noise[n].item() + gamma
-        y[n] = state
-
-    # EMA lowpass at 10 Hz
     cutoff = 10.0
     rc = 1.0 / (2.0 * math.pi * cutoff)
     ema_alpha = T / (rc + T)
-    state = y[0].item()
-    for n in range(num_samples):
-        state = state + ema_alpha * (y[n].item() - state)
-        y[n] = state
 
-    return y
+    noise = np.random.randn(num_samples).astype(np.float32) / 2.33
+    y = _ou_kernel(noise, alpha, beta, gamma, ema_alpha)
+    return torch.from_numpy(y)
 
 
 def _wow_lfo(num_samples: int, sample_rate: int,
@@ -400,8 +411,10 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         max_depth: Optional[float] = None,
         min_rate: Optional[float] = None,
         max_rate: Optional[float] = None,
+        return_clean: bool = False,
     ):
         super().__init__()
+        self.return_clean = return_clean
         self.audio_dir = audio_dir
         self.subset = subset
         self.length = length
@@ -544,6 +557,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
             af.loaded = False
 
         self.input_files_loaded = {}
+        gc.collect()  # Free old tensors before loading new ones to avoid peak memory spike
         self.items_since_load = 0
         nbytes_loaded = 0
         max_bytes = self.buffer_size_gb * 1e9
@@ -617,10 +631,14 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         ja_target = (ja_val - self.min_ja) / (self.max_ja - self.min_ja)
         depth_target = (depth_val - self.min_depth) / (self.max_depth - self.min_depth)
         rate_target = (rate_val - self.min_rate) / (self.max_rate - self.min_rate)
-        return (y,
-                torch.tensor(ja_target, dtype=torch.float32),
-                torch.tensor(depth_target, dtype=torch.float32),
-                torch.tensor(rate_target, dtype=torch.float32))
+        targets = (torch.tensor(ja_target, dtype=torch.float32),
+                   torch.tensor(depth_target, dtype=torch.float32),
+                   torch.tensor(rate_target, dtype=torch.float32))
+        if self.return_clean:
+            x_clean = utils.linear_fade(utils.conform_length(x.clone(), self.length),
+                                        sample_rate=self.sample_rate)
+            return (x_clean, y) + targets
+        return (y,) + targets
 
     def _apply_dual_param(self, x: torch.Tensor):
         """Apply WF with independent depth+rate, return (y, depth_target, rate_target)."""
@@ -644,6 +662,12 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         y = utils.linear_fade(y, sample_rate=self.sample_rate)
 
         if self.regression:
+            if self.return_clean:
+                x_clean = utils.linear_fade(utils.conform_length(x.clone(), self.length),
+                                            sample_rate=self.sample_rate)
+                return (x_clean, y,
+                        torch.tensor(depth_target, dtype=torch.float32),
+                        torch.tensor(rate_target, dtype=torch.float32))
             return (y,
                     torch.tensor(depth_target, dtype=torch.float32),
                     torch.tensor(rate_target, dtype=torch.float32))
@@ -663,6 +687,10 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         y = utils.linear_fade(y, sample_rate=self.sample_rate)
 
         if self.regression:
+            if self.return_clean:
+                x_clean = utils.linear_fade(utils.conform_length(x.clone(), self.length),
+                                            sample_rate=self.sample_rate)
+                return x_clean, y, torch.tensor(target, dtype=torch.float32)
             return y, torch.tensor(target, dtype=torch.float32)
         return y, class_idx
 

@@ -66,6 +66,8 @@ def parse_args():
     parser.add_argument("--max_depth", type=float, default=None)
     parser.add_argument("--min_rate", type=float, default=None)
     parser.add_argument("--max_rate", type=float, default=None)
+    parser.add_argument("--signal_loss_weight", type=float, default=None)
+    parser.add_argument("--param_loss_weight", type=float, default=None)
 
     return parser.parse_args()
 
@@ -138,6 +140,11 @@ def main():
     for k, v in config.items():
         print(f"  {k}: {v}")
 
+    # Determine signal loss settings before dataset creation (return_clean affects batch format)
+    signal_loss_weight = config.get("signal_loss_weight", 0.0)
+    param_loss_weight = config.get("param_loss_weight", 1.0)
+    use_signal_loss = signal_loss_weight > 0.0 and config.get("regression", False)
+
     # Create datasets
     print("\nLoading datasets...")
     dataset_kwargs = dict(
@@ -166,6 +173,7 @@ def main():
         max_depth=config.get("max_depth"),
         min_rate=config.get("min_rate"),
         max_rate=config.get("max_rate"),
+        return_clean=use_signal_loss,
     )
 
     train_dataset = TapeSaturationDataset(
@@ -218,6 +226,31 @@ def main():
     controller = create_controller(config)
     model_summary(encoder, controller)
 
+    # Signal loss: instantiate forward model and loss function
+    forward_model = None
+    signal_loss_fn = None
+
+    if use_signal_loss:
+        from tape_id.models.tape_processor import DifferentiableForwardModel
+        from tape_id.training.losses import MultiResolutionSTFTLoss
+
+        forward_model = DifferentiableForwardModel(
+            degradation_model=config["degradation_model"],
+            min_param=config["min_param"],
+            max_param=config["max_param"],
+            min_depth=config.get("min_depth", 0.1),
+            max_depth=config.get("max_depth", 0.8),
+            min_rate=config.get("min_rate", 0.1),
+            max_rate=config.get("max_rate", 0.8),
+            sample_rate=config["sample_rate"],
+        )
+        signal_loss_fn = MultiResolutionSTFTLoss(
+            fft_sizes=config.get("signal_loss_fft_sizes", [1024, 2048, 8192]),
+            hop_sizes=config.get("signal_loss_hop_sizes", [256, 512, 2048]),
+            win_lengths=config.get("signal_loss_win_lengths", [1024, 2048, 8192]),
+        )
+        print(f"\nSignal loss enabled: weight={signal_loss_weight}, param_weight={param_loss_weight}")
+
     # Optimizer
     params = list(encoder.parameters()) + list(controller.parameters())
     optimizer = torch.optim.Adam(
@@ -249,6 +282,10 @@ def main():
         patience=config.get("patience", 15),
         min_delta=config.get("min_delta", 0.001),
         grad_clip_norm=config.get("grad_clip_norm", 1.0),
+        forward_model=forward_model,
+        signal_loss_weight=signal_loss_weight,
+        param_loss_weight=param_loss_weight,
+        signal_loss_fn=signal_loss_fn,
     )
 
     # Auto-resume from last checkpoint

@@ -39,6 +39,10 @@ class TapeIdentificationTrainer:
         patience: int = 15,
         min_delta: float = 0.001,
         grad_clip_norm: float = 1.0,
+        forward_model: nn.Module = None,
+        signal_loss_weight: float = 0.0,
+        param_loss_weight: float = 1.0,
+        signal_loss_fn: nn.Module = None,
     ):
         self.encoder = encoder.to(device)
         self.controller = controller.to(device)
@@ -58,6 +62,18 @@ class TapeIdentificationTrainer:
 
         # Loss function
         self.loss_fn = nn.MSELoss() if self.regression else nn.CrossEntropyLoss()
+
+        # Signal loss
+        self.forward_model = forward_model.to(device) if forward_model is not None else None
+        self.signal_loss_weight = signal_loss_weight
+        self.param_loss_weight = param_loss_weight
+        self.signal_loss_fn = signal_loss_fn
+        self.use_signal_loss = (
+            forward_model is not None
+            and signal_loss_weight > 0.0
+            and signal_loss_fn is not None
+            and self.regression
+        )
 
         # TensorBoard
         self.log_dir = Path(log_dir)
@@ -95,6 +111,13 @@ class TapeIdentificationTrainer:
             loss: Scalar loss tensor
             metrics: dict of metric_name -> (sum_value, count)
         """
+        # When signal loss is enabled, x_clean is prepended to the batch tuple
+        if self.use_signal_loss:
+            x_clean = batch[0].to(self.device)
+            batch = batch[1:]
+        else:
+            x_clean = None
+
         if self.triple_param:
             y, target_ja, target_d, target_r = batch
             y = y.to(self.device)
@@ -106,6 +129,11 @@ class TapeIdentificationTrainer:
             loss = (self.loss_fn(pred["ja"], target_ja)
                     + self.loss_fn(pred["depth"], target_d)
                     + self.loss_fn(pred["rate"], target_r))
+
+            if self.use_signal_loss and x_clean is not None:
+                y_rec = self.forward_model(x_clean, pred)
+                sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
+                loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
 
             n = target_ja.size(0)
             diff_ja = pred["ja"] - target_ja
@@ -129,6 +157,11 @@ class TapeIdentificationTrainer:
             pred = self.controller(self.encoder(y))
             loss = self.loss_fn(pred["depth"], target_d) + self.loss_fn(pred["rate"], target_r)
 
+            if self.use_signal_loss and x_clean is not None:
+                y_rec = self.forward_model(x_clean, pred)
+                sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
+                loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
+
             n = target_d.size(0)
             diff_d = pred["depth"] - target_d
             diff_r = pred["rate"] - target_r
@@ -146,6 +179,11 @@ class TapeIdentificationTrainer:
 
             pred = self.controller(self.encoder(y))
             loss = self.loss_fn(pred, target)
+
+            if self.use_signal_loss and x_clean is not None:
+                y_rec = self.forward_model(x_clean, pred)
+                sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
+                loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
 
             n = target.size(0)
             diff = pred - target

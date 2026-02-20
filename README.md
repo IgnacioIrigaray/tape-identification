@@ -1,42 +1,87 @@
-# Tape Saturation Parameter Identification
+# Tape Parameter Identification
 
-Deep learning model for identifying tape saturation parameters from audio.
+Neural network for identifying tape degradation parameters from audio. Given a degraded audio signal, the model predicts the physical parameters of the degradation model that produced it.
 
-Simplified adaptation of [DeepAFx-ST](https://github.com/adobe-research/DeepAFx-ST) focused solely on **parameter identification** (not style transfer).
+Simplified adaptation of [DeepAFx-ST](https://github.com/adobe-research/DeepAFx-ST) focused solely on **parameter identification**.
 
 ## Overview
 
-This project implements a neural network that learns to predict the saturation depth parameter of tape saturation effects by analyzing clean and processed audio pairs.
+The model takes a degraded audio segment as input and predicts the parameters of the degradation applied to it. Training data is generated on-the-fly by applying degradation models with random parameters to clean audio.
 
-**Key Features:**
-- ✅ End-to-end parameter identification using spectral encoder + MLP controller
-- ✅ On-the-fly dataset generation with buffer management for efficient training
-- ✅ TensorBoard logging for real-time training monitoring
-- ✅ Automatic checkpoint recovery from crashes
-- ✅ Multi-resolution STFT loss for audio comparison
-- ✅ Clean, simplified codebase (~500 lines vs ~3000 in original)
+**Degradation models supported:**
+
+| Model | Description | Parameters |
+|-------|-------------|------------|
+| `tanh` | Tanh saturation | `gain` ∈ [1, 10] |
+| `hard_clipping` | Hard clipping | `gain` ∈ [1, 4] |
+| `ja` | Jiles-Atherton hysteresis (full RK4) | `drive` ∈ [1, 10] |
+| `wow_flutter` | Time-base distortion (wow/flutter) | `depth`, `rate` ∈ [0.1, 0.8] |
+| `ja_wf` | JA hysteresis + wow/flutter | `ja`, `depth`, `rate` |
+
+**Controller modes:**
+
+| Mode | Description |
+|------|-------------|
+| Classification | Predicts discrete parameter class |
+| Regression | Predicts continuous parameter value in [0, 1] |
+| Multi-param | Predicts two parameters simultaneously |
+| Triple-param | Predicts JA drive + WF depth + WF rate simultaneously |
+
+## Architecture
+
+```
+Degraded audio (y) ──► SpectralEncoder (MobileNetV2 + STFT)
+                              │
+                              ▼
+                        Embedding [1024-dim]
+                              │
+                              ▼
+                       ParameterController (MLP)
+                              │
+                              ▼
+                    Predicted parameters [0, 1]
+```
+
+### Components
+
+**SpectralEncoder**
+- STFT spectrogram: n_fft=4096, hop=2048, power compression |X|^0.3
+- MobileNetV2 backbone (width_mult=2) on normalized spectrogram
+- L2-normalized output embedding: 1024-dim
+
+**ParameterController**
+- Single-param regression: `[1024] → [256] → [1]` + Sigmoid
+- Triple-param regression: shared trunk + 3 heads (ja / depth / rate)
+- Classification: replaces Sigmoid with softmax over N classes
+
+**DifferentiableForwardModel** (for signal loss)
+- Differentiable approximation of each degradation for use in the training loop
+- JA: uses anhysteretic Langevin curve `3a·L(x/a)` instead of full RK4
+- Wow/flutter: sinusoidal LFO with `torch.lerp` interpolation
+
+### Loss Functions
+
+**Parameter loss** (always active):
+- Regression: `MSELoss(predicted_params, target_params)`
+- Classification: `CrossEntropyLoss(logits, class_idx)`
+
+**Signal loss** (optional, regression only):
+- Multi-Resolution STFT Loss comparing log-magnitude at 3 resolutions
+- `MR-STFT(forward_model(x_clean, predicted_params), y_degraded)`
+- Enabled by setting `signal_loss_weight > 0` in config
+
+**Combined loss:**
+```
+total = param_loss_weight * param_loss + signal_loss_weight * signal_loss
+```
 
 ## Installation
 
-### Requirements
-- Python 3.8+
-- PyTorch 1.9+
-- CUDA (optional, for GPU training)
-
-### Setup
-
 ```bash
-# Clone repository
-git clone https://github.com/YOUR_USERNAME/tape-identification.git
-cd tape-identification
-
-# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# venv\Scripts\activate  # Windows
-
-# Install dependencies
+source venv/bin/activate
 pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Usage
@@ -44,210 +89,159 @@ pip install -r requirements.txt
 ### Training
 
 ```bash
-python scripts/train.py
+python scripts/train.py --config configs/default.yaml --name my_experiment
 ```
 
-The script will:
-1. Load audio dataset from `audio_dir`
-2. Apply tape saturation with random depth values [1, 10]
-3. Train encoder + controller to predict saturation parameters
-4. Save checkpoints to `outputs/checkpoints/`
-5. Log metrics to TensorBoard in `outputs/logs/`
-
-**Configuration** (edit in `scripts/train.py`):
-- `audio_dir`: Path to audio dataset (MP3 or WAV files)
-- `batch_size`: Batch size (default: 16)
-- `num_epochs`: Training epochs (default: 50)
-- `learning_rate`: Learning rate (default: 3e-4)
-- `num_workers`: DataLoader workers (default: 0)
-- `buffer_size_gb`: Audio buffer size in GB (default: 0.5)
-
-**Resume from Checkpoint:**
-If training is interrupted, the script automatically detects existing checkpoints and asks if you want to resume:
-```
-Found checkpoint: outputs/checkpoints/checkpoint_epoch18.pt
-Resume from this checkpoint? (y/n):
-```
-
-### Monitoring with TensorBoard
+All config values can be overridden from the CLI:
 
 ```bash
-tensorboard --logdir=outputs/logs
+# Single-param JA regression
+python scripts/train.py --config configs/default.yaml --name ja_reg \
+    --degradation_model ja --regression true
+
+# Triple-param (JA + wow/flutter)
+python scripts/train.py --config configs/triple_param.yaml --name triple_v1
+
+# With signal loss
+python scripts/train.py --config configs/default.yaml --name ja_signal \
+    --signal_loss_weight 0.1 --param_loss_weight 1.0
 ```
 
-Then open http://localhost:6006 in your browser.
+Training auto-detects existing checkpoints and offers to resume.
 
-**Logged Metrics:**
-- `train/loss_step`: Training loss per batch
-- `train/depth_mean`, `train/depth_std`: Predicted depth statistics
-- `val/loss`: Validation loss per epoch
-- `loss_comparison`: Train vs validation loss comparison
+### Configuration
 
-See [TENSORBOARD.md](TENSORBOARD.md) for detailed documentation.
+Key config parameters (`configs/default.yaml`):
+
+```yaml
+# Data
+audio_dir: /path/to/audio
+ext: mp3                          # or wav
+sample_rate: 22050
+audio_length: 65536               # ~3 seconds
+
+# Model
+degradation_model: ja             # tanh | hard_clipping | ja | wow_flutter | ja_wf
+regression: true
+num_classes: 3                    # for classification mode
+min_param: 1.0
+max_param: 10.0
+embed_dim: 1024
+hidden_dim: 256
+
+# Training
+batch_size: 32
+num_epochs: 400
+learning_rate: 5.0e-5
+patience: 15                      # early stopping
+grad_clip_norm: 1.0
+
+# Signal loss (optional)
+signal_loss_weight: 0.0           # 0 = disabled
+param_loss_weight: 1.0
+```
+
+For triple-param mode (`ja_wf`), also configure:
+
+```yaml
+degradation_model: ja_wf
+min_depth: 0.1
+max_depth: 0.8
+min_rate: 0.1
+max_rate: 0.8
+```
+
+### Monitoring
+
+```bash
+tensorboard --logdir=outputs/my_experiment/logs
+```
+
+Logged metrics:
+- `train/loss_step`, `train/loss_epoch`: training loss
+- `val/loss`: validation loss
+- `train/mae_*`, `val/mae_*`: mean absolute error per parameter (regression)
+- `train/rmse_*`, `val/rmse_*`: RMSE per parameter
+- `val/accuracy_*`: accuracy per parameter (classification)
+- `train/signal_loss_step`: signal loss (when enabled)
 
 ### Evaluation
 
 ```bash
-python scripts/evaluate.py --checkpoint outputs/checkpoints/best_model.pt
-```
-
-Evaluates the model on test audio with known saturation depths and reports MAE.
-
-### Testing
-
-```bash
-python tests/test_model.py
-```
-
-Runs unit tests for all model components.
-
-## Architecture
-
-```
-Audio Input → Encoder (MobileNetV2) → Embeddings
-                                          ↓
-                                      Controller (MLP)
-                                          ↓
-                                  Parameters [0,1] (normalized)
-                                          ↓
-Audio Input → Processor (Tape Saturation) → Audio Output
-```
-
-### Components
-
-1. **SpectralEncoder**
-   - Converts audio to mel-spectrogram
-   - Uses custom MobileNetV2 (width_mult=2) for feature extraction
-   - Applies specific normalization: mean=0.322970, std=0.278452
-   - L2 normalization on embeddings
-   - Output: 128-dim embedding
-
-2. **ParameterController**
-   - Takes embeddings from input and target audio
-   - Concatenates and processes through 3-layer MLP
-   - Output: 1 parameter in [0, 1] range
-
-3. **TapeSaturationProcessor**
-   - Applies differentiable tape saturation
-   - Formula: `y = tanh(x * depth)`
-   - Denormalizes parameter: [0,1] → [1,10]
-
-### Loss Function
-
-**Multi-Resolution STFT Loss:**
-- Compares spectrograms at multiple resolutions
-- FFT sizes: 1024, 2048, 8192
-- Combines spectral convergence and log magnitude errors
-
-## Dataset
-
-The `TapeSaturationDataset` generates training pairs on-the-fly:
-
-1. Loads random audio chunks from dataset
-2. Normalizes to 0 dBFS (peak = 1.0)
-3. Applies tape saturation with random depth ∈ [1, 10]
-4. Returns (clean, saturated) audio pairs
-
-**Buffer Management:**
-- Preloads audio chunks into RAM for faster iteration
-- Configurable buffer size and reload rate
-- Dramatically improves training speed vs disk I/O
-
-## Model Summary
-
-```
-============================================================
-MODEL SUMMARY
-============================================================
-Encoder:         7.14 M parameters
-Controller:      0.13 M parameters
-Processor:       0.00 M parameters
-------------------------------------------------------------
-Total:           7.27 M parameters
-============================================================
+python scripts/evaluate.py \
+    --checkpoint outputs/my_experiment/checkpoints/best_model.pt \
+    --config outputs/my_experiment/config.yaml \
+    --audio_dir /path/to/test/audio
 ```
 
 ## Project Structure
 
 ```
 tape-identification/
-├── tape_id/                    # Source code
-│   ├── models/                # Neural network models
-│   │   ├── encoder.py         # SpectralEncoder (MobileNetV2-based)
-│   │   ├── controller.py      # ParameterController (MLP)
-│   │   ├── tape_processor.py  # TapeSaturationProcessor
-│   │   └── mobilenetv2.py     # Custom MobileNetV2 implementation
-│   ├── data/                  # Dataset and data loading
-│   │   ├── dataset.py         # TapeSaturationDataset
-│   │   └── audio.py           # AudioFile helper classes
-│   ├── training/              # Training infrastructure
-│   │   ├── trainer.py         # Training loop with logging
-│   │   └── losses.py          # Multi-resolution STFT loss
-│   └── utils.py               # Utilities (model summary, etc.)
+├── tape_id/
+│   ├── models/
+│   │   ├── encoder.py          # SpectralEncoder (MobileNetV2 + STFT)
+│   │   ├── controller.py       # ParameterController (MLP, single/multi/triple)
+│   │   ├── tape_processor.py   # Degradation processors + DifferentiableForwardModel
+│   │   └── mobilenetv2.py      # MobileNetV2 backbone
+│   ├── data/
+│   │   ├── dataset.py          # TapeSaturationDataset (on-the-fly generation)
+│   │   └── audio.py            # AudioFile I/O helper
+│   ├── training/
+│   │   ├── trainer.py          # Training loop (classification / regression / triple)
+│   │   └── losses.py           # MultiResolutionSTFTLoss
+│   └── utils.py
 ├── scripts/
-│   ├── train.py               # Training script
-│   └── evaluate.py            # Evaluation script
+│   ├── train.py                # Main training script
+│   └── evaluate.py             # Evaluation script
+├── configs/
+│   ├── default.yaml            # Single-param regression (JA)
+│   └── triple_param.yaml       # Triple-param regression (JA + wow/flutter)
 ├── tests/
-│   └── test_model.py          # Unit tests
-├── outputs/
-│   ├── checkpoints/           # Model checkpoints
-│   └── logs/                  # TensorBoard logs
-├── requirements.txt
-├── TENSORBOARD.md             # TensorBoard documentation
-└── README.md
+└── outputs/
+    └── <experiment_name>/
+        ├── checkpoints/        # best_model.pt, last_model.pt
+        ├── logs/               # TensorBoard logs
+        ├── eval/               # Evaluation results
+        └── config.yaml         # Config copy for reproducibility
 ```
 
-## Differences from DeepAFx-ST
+## Audio Format
 
-**Code Directly Copied:**
-- ✅ `mobilenetv2.py`: Exact copy of custom MobileNetV2 encoder
-- ✅ `encoder.py`: SpectralEncoder with specific normalization values
-- ✅ Buffer management logic from dataset implementation
+- Sample rate: 22050 Hz
+- Segment length: 65536 samples (~3 seconds)
+- Normalization: peak to 0 dBFS before degradation
+- Fades: 50ms linear fade in/out applied after degradation
 
-**Simplifications:**
-- ❌ Removed style transfer (only parameter identification)
-- ❌ Removed SPSA optimization
-- ❌ Removed proxy network training
-- ❌ Removed encoder freezing options
-- ❌ Removed EfficientNet option (only MobileNetV2)
-- ✅ Native PyTorch training (no PyTorch Lightning)
-- ✅ Simplified codebase focused on single effect (tape saturation)
-- ✅ Added robust error handling and checkpoint recovery
-- ✅ Added comprehensive TensorBoard logging
+## Dataset Generation
+
+The dataset generates `(y_degraded, *targets)` pairs on-the-fly:
+
+1. Load random audio patch from RAM buffer
+2. Normalize to 0 dBFS
+3. Sample random parameter(s) uniformly from configured range
+4. Apply degradation model
+5. Apply length conforming + fade in/out
+6. Normalize target parameter(s) to [0, 1]
+
+When signal loss is enabled, clean audio `x_clean` is also returned as the first batch element: `(x_clean, y_degraded, *targets)`.
+
+**Buffer management:** Audio files are preloaded into RAM in configurable chunks (`buffer_size_gb`) and refreshed periodically (`buffer_reload_rate`), avoiding disk I/O bottlenecks during training.
 
 ## Training Tips
 
-1. **Dataset**: Use diverse audio (music, speech, etc.) for better generalization
-2. **Buffer Size**: Increase `buffer_size_gb` if you have RAM available for faster training
-3. **Workers**: Set `num_workers > 0` only if using Linux (may cause issues on some systems)
-4. **Learning Rate**: Default 3e-4 works well, reduce if training is unstable
-5. **Epochs**: Model typically converges in 20-30 epochs
-
-## Troubleshooting
-
-**Training crashes intermittently:**
-- Enable automatic recovery by setting `num_workers=0`
-- Check `outputs/checkpoints/training.log` for error details
-- Emergency checkpoints are saved automatically
-
-**High GPU memory usage:**
-- Reduce `batch_size`
-- Reduce `audio_length`
-
-**Slow training:**
-- Increase `buffer_size_gb` to preload more audio
-- Enable `num_workers > 0` (if on Linux)
-- Use GPU instead of CPU
-
-## License
-
-This project uses code from [DeepAFx-ST](https://github.com/adobe-research/DeepAFx-ST) which is licensed under BSD-3-Clause.
-
-See [LICENSE](LICENSE) for details.
+- **Signal loss weight**: Start with `signal_loss_weight: 0.1`. The MR-STFT loss is ~10-30x larger than MSE in absolute terms at initialization, so keep `param_loss_weight` proportionally higher if both are active.
+- **JA signal loss**: The differentiable forward model uses the anhysteretic approximation (not full RK4), so there is an irreducible mismatch. Signal loss is most accurate for `tanh` and `hard_clipping`.
+- **Learning rate**: `5e-5` with `ReduceLROnPlateau` (factor=0.5, patience=5) works well.
+- **Early stopping**: Default patience=15 epochs. The scheduler reduces LR before stopping.
+- **Buffer size**: Larger `buffer_size_gb` (up to your available RAM) improves variety per epoch.
 
 ## References
 
-- **DeepAFx-ST Paper**: [Differentiable All-pole Filters for Time-varying Audio Systems](https://arxiv.org/abs/2211.00497)
-- **DeepAFx-ST Repository**: https://github.com/adobe-research/DeepAFx-ST
+- **DeepAFx-ST**: [Differentiable Signal Processing with Black-Box Audio Effects](https://arxiv.org/abs/2105.04752) — original architecture
+- **Jiles-Atherton model**: AnalogTapeModel by Jatin Chowdhury
 - **MobileNetV2**: [Inverted Residuals and Linear Bottlenecks](https://arxiv.org/abs/1801.04381)
 
+## License
+
+Uses code from [DeepAFx-ST](https://github.com/adobe-research/DeepAFx-ST) (BSD-3-Clause). See [LICENSE](LICENSE).

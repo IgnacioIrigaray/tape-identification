@@ -154,3 +154,137 @@ class HardClippingProcessor(nn.Module):
 
     def get_gain_from_logits(self, logits):
         return gain_from_logits(logits, self.gain_values)
+
+
+class DifferentiableForwardModel(nn.Module):
+    """Apply a degradation with continuous predicted parameters in [0, 1].
+
+    Converts normalised predictions to physical parameter space and applies
+    a differentiable approximation of the degradation for signal-loss computation.
+
+    Supported degradation_model values: "tanh", "ja", "hard_clipping", "ja_wf".
+
+    For "ja_wf" (triple-param), applies JA anhysteretic saturation followed by a
+    sinusoidal wow/flutter LFO with torch.lerp interpolation.
+
+    Args:
+        degradation_model: Name of the degradation model.
+        min_param: Minimum physical parameter (JA drive / tanh gain / clip gain).
+        max_param: Maximum physical parameter.
+        min_depth: Minimum wow/flutter depth (ja_wf only).
+        max_depth: Maximum wow/flutter depth (ja_wf only).
+        min_rate: Minimum wow rate (ja_wf only).
+        max_rate: Maximum wow rate (ja_wf only).
+        sample_rate: Audio sample rate in Hz.
+    """
+
+    def __init__(
+        self,
+        degradation_model: str,
+        min_param: float,
+        max_param: float,
+        min_depth: float = 0.1,
+        max_depth: float = 0.8,
+        min_rate: float = 0.1,
+        max_rate: float = 0.8,
+        sample_rate: int = 22050,
+    ):
+        super().__init__()
+        self.degradation_model = degradation_model
+        self.min_param = min_param
+        self.max_param = max_param
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.min_rate = min_rate
+        self.max_rate = max_rate
+        self.sample_rate = sample_rate
+
+    def forward(self, x_clean: torch.Tensor, pred) -> torch.Tensor:
+        """Apply degradation differentiably.
+
+        Args:
+            x_clean: Clean audio [batch, 1, samples].
+            pred: Normalised predictions in [0, 1].
+                  Tensor [B, 1] for single-param modes.
+                  Dict {"ja": [B,1], "depth": [B,1], "rate": [B,1]} for "ja_wf".
+
+        Returns:
+            Degraded audio [batch, 1, samples].
+        """
+        if self.degradation_model == "ja_wf":
+            return self._apply_ja_wf(x_clean, pred)
+        elif self.degradation_model == "ja":
+            return self._apply_ja(x_clean, pred)
+        elif self.degradation_model == "hard_clipping":
+            return self._apply_hard_clipping(x_clean, pred)
+        else:  # "tanh"
+            return self._apply_tanh(x_clean, pred)
+
+    def _apply_tanh(self, x, pred):
+        gain = self.min_param + pred * (self.max_param - self.min_param)  # [B, 1]
+        gain = gain.unsqueeze(-1)                                          # [B, 1, 1]
+        return torch.tanh(x * gain)
+
+    def _apply_ja(self, x, pred):
+        gain = self.min_param + pred * (self.max_param - self.min_param)  # [B, 1]
+        gain = gain.unsqueeze(-1)                                          # [B, 1, 1]
+        a = 1.0 / gain
+        return 3.0 * a * langevin(x / a)
+
+    def _apply_hard_clipping(self, x, pred):
+        gain = self.min_param + pred * (self.max_param - self.min_param)  # [B, 1]
+        gain = gain.unsqueeze(-1)                                          # [B, 1, 1]
+        return torch.clamp(x * gain, -1.0, 1.0)
+
+    def _apply_ja_wf(self, x, pred):
+        # JA saturation (differentiable anhysteretic approximation)
+        gain = self.min_param + pred["ja"] * (self.max_param - self.min_param)  # [B, 1]
+        gain = gain.unsqueeze(-1)                                                # [B, 1, 1]
+        a = 1.0 / gain
+        y = 3.0 * a * langevin(x / a)
+
+        # Sinusoidal wow/flutter with torch.lerp
+        y = self._apply_wow_flutter_batch(y, pred["depth"], pred["rate"])
+        return y
+
+    def _apply_wow_flutter_batch(self, y, depth_norm, rate_norm):
+        """Apply sinusoidal wow/flutter per item in batch (differentiable w.r.t. depth, rate)."""
+        B, _, S = y.shape
+        out = torch.zeros_like(y)
+        for i in range(B):
+            depth = self.min_depth + depth_norm[i, 0] * (self.max_depth - self.min_depth)
+            rate = self.min_rate + rate_norm[i, 0] * (self.max_rate - self.min_rate)
+            out[i] = self._sinusoidal_wow_flutter(y[i], depth, rate, S)
+        return out
+
+    def _sinusoidal_wow_flutter(self, x, depth, rate, num_samples):
+        """Differentiable sinusoidal LFO with linear interpolation.
+
+        Args:
+            x: Audio [1, samples].
+            depth: Wow depth (physical), scalar tensor — differentiable.
+            rate: Wow rate (physical), scalar tensor — differentiable.
+            num_samples: Number of samples.
+
+        Returns:
+            Time-warped audio [1, samples].
+        """
+        import math
+        # Exponential mapping rate → frequency (mirrors dataset mapping)
+        wow_freq = torch.pow(torch.tensor(4.5, device=x.device, dtype=x.dtype), rate) - 1.0
+        amplitude = depth * self.sample_rate * 0.005  # max ~5 ms delay
+
+        t = torch.arange(num_samples, dtype=x.dtype, device=x.device)
+        phase = 2.0 * math.pi * wow_freq * t / self.sample_rate
+        lfo = amplitude * torch.cos(phase) + amplitude  # always >= 0
+
+        # Fractional delay indices
+        indices = t - lfo
+        indices = torch.clamp(indices, 0.0, float(num_samples - 1))
+        idx_floor = indices.long()
+        idx_ceil = torch.clamp(idx_floor + 1, max=num_samples - 1)
+        frac = indices - idx_floor.float()
+
+        x_flat = x.squeeze(0)
+        y_flat = torch.lerp(x_flat[idx_floor], x_flat[idx_ceil], frac)
+        return y_flat.unsqueeze(0)
