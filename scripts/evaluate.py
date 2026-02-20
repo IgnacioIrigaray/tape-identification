@@ -28,6 +28,8 @@ from tqdm import tqdm
 
 from tape_id.models.encoder import SpectralEncoder
 from tape_id.models.controller import ParameterController
+from tape_id.models.tape_processor import DifferentiableForwardModel
+from tape_id.training.losses import MultiResolutionSTFTLoss
 from tape_id.data.dataset import hard_clipping, tape_saturation, ja_saturation, wow_flutter
 from tape_id.utils import split_dataset, conform_length, linear_fade
 
@@ -301,7 +303,9 @@ def save_scatter_plots(results, epoch, output_path):
 # Evaluation loops
 # ---------------------------------------------------------------------------
 
-def evaluate_triple_param(encoder, controller, test_files, config, device):
+def evaluate_triple_param(encoder, controller, test_files, config, device,
+                          plot_path=None, epoch=None, plot_every=25,
+                          forward_model=None, signal_loss_fn=None):
     """Evaluate triple-param regression: JA drive + WF depth + WF rate."""
     sample_rate = config["sample_rate"]
     audio_length = config["audio_length"]
@@ -312,40 +316,76 @@ def evaluate_triple_param(encoder, controller, test_files, config, device):
     all_true = {"ja": [], "depth": [], "rate": []}
     all_pred = {"ja": [], "depth": [], "rate": []}
 
+    accum_ae = {"ja": 0.0, "depth": 0.0, "rate": 0.0}
+    accum_sig_loss = 0.0
+    count = 0
+    use_signal_loss = forward_model is not None and signal_loss_fn is not None
+
     pbar = tqdm(test_files, ncols=80)
-    for fpath in pbar:
-        audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
+    with torch.no_grad():
+        for fpath in pbar:
+            audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
 
-        ja_val = random.uniform(min_ja, max_ja)
-        depth_val = random.uniform(min_d, max_d)
-        rate_val = random.uniform(min_r, max_r)
+            ja_val = random.uniform(min_ja, max_ja)
+            depth_val = random.uniform(min_d, max_d)
+            rate_val = random.uniform(min_r, max_r)
 
-        x = audio.unsqueeze(0)
-        y = ja_saturation(x, ja_val, sample_rate=sample_rate)
-        y = wow_flutter(y, depth_val, sample_rate=sample_rate,
-                        wow_rate=rate_val,
-                        flutter_rate=config.get("flutter_rate", 0.5),
-                        enable_ou=config.get("enable_ou", True),
-                        interpolation=config.get("wf_interpolation", "linear"))
-        y = conform_length(y, audio_length)
-        y = linear_fade(y, sample_rate=sample_rate)
+            x = audio.unsqueeze(0)
+            y = ja_saturation(x, ja_val, sample_rate=sample_rate)
+            y = wow_flutter(y, depth_val, sample_rate=sample_rate,
+                            wow_rate=rate_val,
+                            flutter_rate=config.get("flutter_rate", 0.5),
+                            enable_ou=config.get("enable_ou", True),
+                            interpolation=config.get("wf_interpolation", "linear"))
+            y = conform_length(y, audio_length)
+            y = linear_fade(y, sample_rate=sample_rate)
 
-        y_in = y.unsqueeze(0).to(device)
-        with torch.no_grad():
+            y_in = y.unsqueeze(0).to(device)
             pred = controller(encoder(y_in))
 
-        all_true["ja"].append(ja_val)
-        all_true["depth"].append(depth_val)
-        all_true["rate"].append(rate_val)
-        all_pred["ja"].append(pred["ja"].item() * (max_ja - min_ja) + min_ja)
-        all_pred["depth"].append(pred["depth"].item() * (max_d - min_d) + min_d)
-        all_pred["rate"].append(pred["rate"].item() * (max_r - min_r) + min_r)
+            pred_ja = pred["ja"].item() * (max_ja - min_ja) + min_ja
+            pred_d = pred["depth"].item() * (max_d - min_d) + min_d
+            pred_r = pred["rate"].item() * (max_r - min_r) + min_r
 
-        if len(all_true["ja"]) > 1:
-            mae_ja = np.mean(np.abs(np.array(all_true["ja"]) - np.array(all_pred["ja"])))
-            mae_d = np.mean(np.abs(np.array(all_true["depth"]) - np.array(all_pred["depth"])))
-            mae_r = np.mean(np.abs(np.array(all_true["rate"]) - np.array(all_pred["rate"])))
-            pbar.set_postfix(ja=f"{mae_ja:.3f}", d=f"{mae_d:.3f}", r=f"{mae_r:.3f}")
+            all_true["ja"].append(ja_val)
+            all_true["depth"].append(depth_val)
+            all_true["rate"].append(rate_val)
+            all_pred["ja"].append(pred_ja)
+            all_pred["depth"].append(pred_d)
+            all_pred["rate"].append(pred_r)
+
+            accum_ae["ja"] += abs(ja_val - pred_ja)
+            accum_ae["depth"] += abs(depth_val - pred_d)
+            accum_ae["rate"] += abs(rate_val - pred_r)
+
+            if use_signal_loss:
+                x_in = x.unsqueeze(0).to(device)  # [1, 1, L]
+                y_rec = forward_model(x_in, pred)
+                sig_loss = signal_loss_fn(y_rec.squeeze(1), y_in.squeeze(1))
+                accum_sig_loss += sig_loss.item()
+
+            count += 1
+
+            if count > 1:
+                postfix = dict(
+                    ja=f"{accum_ae['ja']/count:.3f}",
+                    d=f"{accum_ae['depth']/count:.3f}",
+                    r=f"{accum_ae['rate']/count:.3f}",
+                )
+                if use_signal_loss:
+                    postfix["sig"] = f"{accum_sig_loss/count:.3f}"
+                pbar.set_postfix(postfix)
+
+            if plot_path and count > 1 and count % plot_every == 0:
+                interim = []
+                for name, key, lo, hi in [
+                    ("JA Drive", "ja", min_ja, max_ja),
+                    ("WF Depth", "depth", min_d, max_d),
+                    ("WF Rate", "rate", min_r, max_r),
+                ]:
+                    interim.append((name, np.array(all_true[key]),
+                                    np.array(all_pred[key]), lo, hi))
+                save_scatter_plots(interim, epoch, plot_path)
 
     # Compute and print metrics for each parameter
     params = [
@@ -371,10 +411,15 @@ def evaluate_triple_param(encoder, controller, test_files, config, device):
     for name, mae, r2 in summary:
         print(f"  {name:>10}  {mae:8.4f}  {r2:8.4f}")
 
+    if use_signal_loss and count > 0:
+        print(f"\n  Signal loss (MR-STFT): {accum_sig_loss / count:.4f}")
+
     return results_for_plot
 
 
-def evaluate_regression(encoder, controller, test_files, config, device):
+def evaluate_regression(encoder, controller, test_files, config, device,
+                        plot_path=None, epoch=None, plot_every=25,
+                        forward_model=None, signal_loss_fn=None):
     """Evaluate single-param regression."""
     sample_rate = config["sample_rate"]
     audio_length = config["audio_length"]
@@ -383,27 +428,50 @@ def evaluate_regression(encoder, controller, test_files, config, device):
     param_range = max_p - min_p
 
     all_true, all_pred = [], []
+    accum_ae, accum_sig_loss, count = 0.0, 0.0, 0
+    use_signal_loss = forward_model is not None and signal_loss_fn is not None
 
     pbar = tqdm(test_files, ncols=80)
-    for fpath in pbar:
-        audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
-        param = random.uniform(min_p, max_p)
+    with torch.no_grad():
+        for fpath in pbar:
+            audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
+            param = random.uniform(min_p, max_p)
 
-        x = audio.unsqueeze(0)
-        audio_deg = _apply_degradation(x, param, config)
-        audio_deg = conform_length(audio_deg, audio_length)
-        audio_deg = linear_fade(audio_deg, sample_rate=sample_rate)
+            x = audio.unsqueeze(0)
+            audio_deg = _apply_degradation(x, param, config)
+            audio_deg = conform_length(audio_deg, audio_length)
+            audio_deg = linear_fade(audio_deg, sample_rate=sample_rate)
 
-        y = audio_deg.unsqueeze(0).to(device)
-        with torch.no_grad():
-            pred_norm = controller(encoder(y)).item()
+            y = audio_deg.unsqueeze(0).to(device)
+            pred_tensor = controller(encoder(y))  # [1, 1]
+            pred_norm = pred_tensor.item()
 
-        all_true.append(param)
-        all_pred.append(pred_norm * param_range + min_p)
+            pred_val = pred_norm * param_range + min_p
+            all_true.append(param)
+            all_pred.append(pred_val)
 
-        if len(all_true) > 1:
-            mae_so_far = np.mean(np.abs(np.array(all_true) - np.array(all_pred)))
-            pbar.set_postfix(mae=f"{mae_so_far:.3f}")
+            accum_ae += abs(param - pred_val)
+
+            if use_signal_loss:
+                x_in = x.unsqueeze(0).to(device)  # [1, 1, L]
+                y_rec = forward_model(x_in, pred_tensor)
+                sig_loss = signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
+                accum_sig_loss += sig_loss.item()
+
+            count += 1
+
+            if count > 1:
+                postfix = {"mae": f"{accum_ae/count:.3f}"}
+                if use_signal_loss:
+                    postfix["sig"] = f"{accum_sig_loss/count:.3f}"
+                pbar.set_postfix(postfix)
+
+            if plot_path and count > 1 and count % plot_every == 0:
+                model_name = config["degradation_model"]
+                save_scatter_plots(
+                    [(model_name, np.array(all_true), np.array(all_pred), min_p, max_p)],
+                    epoch, plot_path,
+                )
 
     true_arr = np.array(all_true)
     pred_arr = np.array(all_pred)
@@ -412,6 +480,9 @@ def evaluate_regression(encoder, controller, test_files, config, device):
     print("=" * 60)
     print(f"Regression results ({len(all_true)} samples)")
     print_regression_metrics(metrics, config["degradation_model"], min_p, max_p)
+
+    if use_signal_loss and count > 0:
+        print(f"\n  Signal loss (MR-STFT): {accum_sig_loss / count:.4f}")
 
     # Sample predictions
     print(f"\nSample predictions (first 20):")
@@ -442,27 +513,27 @@ def evaluate_classification(encoder, controller, test_files, config, device):
 
     pbar = tqdm(test_files, ncols=80)
     correct, total = 0, 0
-    for fpath in pbar:
-        audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
+    with torch.no_grad():
+        for fpath in pbar:
+            audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
 
-        class_idx = random.randint(0, num_classes - 1)
-        param = param_values[class_idx]
+            class_idx = random.randint(0, num_classes - 1)
+            param = param_values[class_idx]
 
-        x = audio.unsqueeze(0)
-        audio_deg = _apply_degradation(x, param, config)
-        audio_deg = conform_length(audio_deg, audio_length)
-        audio_deg = linear_fade(audio_deg, sample_rate=sample_rate)
+            x = audio.unsqueeze(0)
+            audio_deg = _apply_degradation(x, param, config)
+            audio_deg = conform_length(audio_deg, audio_length)
+            audio_deg = linear_fade(audio_deg, sample_rate=sample_rate)
 
-        y = audio_deg.unsqueeze(0).to(device)
-        with torch.no_grad():
+            y = audio_deg.unsqueeze(0).to(device)
             logits = controller(encoder(y))
             pred_idx = torch.argmax(logits, dim=-1).item()
 
-        if pred_idx == class_idx:
-            correct += 1
-        total += 1
-        confusion[class_idx][pred_idx] += 1
-        pbar.set_postfix(acc=f"{100 * correct / total:.1f}%")
+            if pred_idx == class_idx:
+                correct += 1
+            total += 1
+            confusion[class_idx][pred_idx] += 1
+            pbar.set_postfix(acc=f"{100 * correct / total:.1f}%")
 
     print("=" * 60)
     print_confusion_matrix(confusion, param_labels, config["degradation_model"])
@@ -485,36 +556,38 @@ def evaluate_multi_param(encoder, controller, test_files, config, device):
 
     confusion_depth = np.zeros((nc_d, nc_d), dtype=int)
     confusion_rate = np.zeros((nc_r, nc_r), dtype=int)
-    correct_both, total = 0, 0
+    correct_both, correct_d, correct_r, total = 0, 0, 0, 0
 
     pbar = tqdm(test_files, ncols=80)
-    for fpath in pbar:
-        audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
+    with torch.no_grad():
+        for fpath in pbar:
+            audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
 
-        depth_idx = random.randint(0, nc_d - 1)
-        rate_idx = random.randint(0, nc_r - 1)
+            depth_idx = random.randint(0, nc_d - 1)
+            rate_idx = random.randint(0, nc_r - 1)
 
-        x = audio.unsqueeze(0)
-        audio_deg = _apply_degradation(x, depth_values[depth_idx], config,
-                                       wow_rate_override=rate_values[rate_idx])
-        audio_deg = conform_length(audio_deg, audio_length)
-        audio_deg = linear_fade(audio_deg, sample_rate=sample_rate)
+            x = audio.unsqueeze(0)
+            audio_deg = _apply_degradation(x, depth_values[depth_idx], config,
+                                           wow_rate_override=rate_values[rate_idx])
+            audio_deg = conform_length(audio_deg, audio_length)
+            audio_deg = linear_fade(audio_deg, sample_rate=sample_rate)
 
-        y = audio_deg.unsqueeze(0).to(device)
-        with torch.no_grad():
+            y = audio_deg.unsqueeze(0).to(device)
             logits = controller(encoder(y))
             pred_d = torch.argmax(logits["depth"], dim=-1).item()
             pred_r = torch.argmax(logits["rate"], dim=-1).item()
 
-        confusion_depth[depth_idx][pred_d] += 1
-        confusion_rate[rate_idx][pred_r] += 1
-        if pred_d == depth_idx and pred_r == rate_idx:
-            correct_both += 1
-        total += 1
+            confusion_depth[depth_idx][pred_d] += 1
+            confusion_rate[rate_idx][pred_r] += 1
+            if pred_d == depth_idx:
+                correct_d += 1
+            if pred_r == rate_idx:
+                correct_r += 1
+            if pred_d == depth_idx and pred_r == rate_idx:
+                correct_both += 1
+            total += 1
 
-        acc_d = 100 * np.trace(confusion_depth) / total
-        acc_r = 100 * np.trace(confusion_rate) / total
-        pbar.set_postfix(d=f"{acc_d:.0f}%", r=f"{acc_r:.0f}%")
+            pbar.set_postfix(d=f"{100*correct_d/total:.0f}%", r=f"{100*correct_r/total:.0f}%")
 
     print("=" * 60)
     print(f"Combined accuracy: {correct_both}/{total} = {100 * correct_both / total:.1f}%")
@@ -538,6 +611,9 @@ def main():
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--max_files", type=int, default=0, help="Max test files (0=all)")
     parser.add_argument("--plot", action="store_true", help="Generate scatter plots")
+    parser.add_argument("--signal_loss", action="store_true",
+                        help="Compute MR-STFT signal loss (regression modes only). "
+                             "Auto-enabled if signal_loss_weight > 0 in config.")
     args = parser.parse_args()
 
     # Resolve config and checkpoint paths
@@ -580,6 +656,31 @@ def main():
     encoder, controller, epoch = load_model(config, checkpoint_path, args.device)
     print(f"Model loaded (epoch {epoch})")
 
+    # Signal loss setup (regression modes only)
+    forward_model = None
+    signal_loss_fn = None
+    compute_signal_loss = (
+        (args.signal_loss or config.get("signal_loss_weight", 0.0) > 0.0)
+        and (regression or triple_param)
+    )
+    if compute_signal_loss:
+        forward_model = DifferentiableForwardModel(
+            degradation_model=degradation_model,
+            min_param=config["min_param"],
+            max_param=config["max_param"],
+            min_depth=config.get("min_depth", 0.1),
+            max_depth=config.get("max_depth", 0.8),
+            min_rate=config.get("min_rate", 0.1),
+            max_rate=config.get("max_rate", 0.8),
+            sample_rate=config["sample_rate"],
+        ).to(args.device)
+        signal_loss_fn = MultiResolutionSTFTLoss(
+            fft_sizes=config.get("signal_loss_fft_sizes", [1024, 2048, 8192]),
+            hop_sizes=config.get("signal_loss_hop_sizes", [256, 512, 2048]),
+            win_lengths=config.get("signal_loss_win_lengths", [1024, 2048, 8192]),
+        )
+        print("Signal loss (MR-STFT): enabled")
+
     # Get test files
     test_files = get_test_files(
         config["audio_dir"],
@@ -592,24 +693,35 @@ def main():
         test_files = test_files[:args.max_files]
         print(f"Using first {args.max_files} files")
 
-    # Run evaluation
-    if triple_param:
-        plot_data = evaluate_triple_param(encoder, controller, test_files, config, args.device)
-    elif regression:
-        plot_data = evaluate_regression(encoder, controller, test_files, config, args.device)
-    elif multi_param:
-        plot_data = evaluate_multi_param(encoder, controller, test_files, config, args.device)
-    else:
-        plot_data = evaluate_classification(encoder, controller, test_files, config, args.device)
-
-    # Generate plots
-    if args.plot and plot_data:
+    # Resolve plot path
+    plot_path = None
+    if args.plot:
         if args.name:
             plot_path = Path("outputs") / args.name / "eval" / "scatter.png"
         else:
             plot_path = Path("outputs") / "eval_scatter.png"
         plot_path.parent.mkdir(parents=True, exist_ok=True)
-        save_scatter_plots(plot_data, epoch, str(plot_path))
+        plot_path = str(plot_path)
+
+    # Run evaluation
+    if triple_param:
+        plot_data = evaluate_triple_param(encoder, controller, test_files, config, args.device,
+                                          plot_path=plot_path, epoch=epoch,
+                                          forward_model=forward_model,
+                                          signal_loss_fn=signal_loss_fn)
+    elif regression:
+        plot_data = evaluate_regression(encoder, controller, test_files, config, args.device,
+                                        plot_path=plot_path, epoch=epoch,
+                                        forward_model=forward_model,
+                                        signal_loss_fn=signal_loss_fn)
+    elif multi_param:
+        plot_data = evaluate_multi_param(encoder, controller, test_files, config, args.device)
+    else:
+        plot_data = evaluate_classification(encoder, controller, test_files, config, args.device)
+
+    # Final plot
+    if plot_path and plot_data:
+        save_scatter_plots(plot_data, epoch, plot_path)
 
 
 if __name__ == "__main__":
