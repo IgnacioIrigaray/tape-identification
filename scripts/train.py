@@ -174,6 +174,16 @@ def main():
         min_rate=config.get("min_rate"),
         max_rate=config.get("max_rate"),
         return_clean=use_signal_loss,
+        # Tape noise (MagTapeDB) — ignored for other models
+        noise_dir=config.get("noise_dir"),
+        noise_input_dirs=config.get("noise_input_dirs"),
+        noise_ext=config.get("noise_ext", "wav"),
+        noise_train_frac=config.get("noise_train_frac", 0.8),
+        noise_buffer_size_gb=config.get("noise_buffer_size_gb", 0.5),
+        noise_buffer_reload_rate=config.get("noise_buffer_reload_rate", 1000),
+        noise_preload=config.get("noise_preload", False),
+        min_data=config.get("min_data"),
+        max_data=config.get("max_data"),
     )
 
     train_dataset = TapeSaturationDataset(
@@ -286,6 +296,8 @@ def main():
         signal_loss_weight=signal_loss_weight,
         param_loss_weight=param_loss_weight,
         signal_loss_fn=signal_loss_fn,
+        min_param=config["min_param"],
+        max_param=config["max_param"],
     )
 
     # Auto-resume from last checkpoint

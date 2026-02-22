@@ -14,15 +14,21 @@ Usage:
     python scripts/process_audio.py --input /path/to/audio --output /path/to/out \
         --model wow_flutter --depth 0.5 --wow_rate 0.4
 
+    python scripts/process_audio.py --input /path/to/audio --output /path/to/out \
+        --model tape_noise --snr 20.0 --noise_dir /path/to/MagTapeDB
+
 Supported models:
     tanh          Tanh saturation             --gain  [1, 10]
     hard_clipping Hard clipping               --gain  [1, 4]
     ja            Jiles-Atherton hysteresis   --drive [1, 10]
     wow_flutter   Wow + flutter               --depth [0.1, 0.8]  --wow_rate [0.1, 0.8]
     ja_wf         JA + wow/flutter            --drive [1, 10]  --depth [0.1, 0.8]  --rate [0.1, 0.8]
+    tape_noise    Additive tape noise         --snr   [5, 40] dB  --noise_dir <MagTapeDB path>
+                                              or --noise_file <single noise file>
 """
 
 import argparse
+import random
 import sys
 from pathlib import Path
 
@@ -33,9 +39,11 @@ import torchaudio
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tape_id.data.dataset import (
-    tape_saturation, hard_clipping, ja_saturation, wow_flutter,
+    tape_saturation, hard_clipping, ja_saturation, wow_flutter, tape_noise,
 )
 from tape_id import utils
+
+EPSILON = 1e-8
 
 
 SAMPLE_RATE = 22050
@@ -92,8 +100,28 @@ def apply_degradation(audio: torch.Tensor, args) -> torch.Tensor:
         )
         return y
 
+    elif model == "tape_noise":
+        noise = args._noise_clip
+        if noise is None:
+            raise ValueError("tape_noise requires --noise_dir or --noise_file")
+        # Match noise length to input
+        length = audio.shape[-1]
+        if noise.shape[-1] < length:
+            repeats = (length // noise.shape[-1]) + 1
+            noise = noise.repeat(1, repeats)
+        max_start = noise.shape[-1] - length
+        start = random.randint(0, max_start) if max_start > 0 else 0
+        noise = noise[:, start:start + length]
+        noise = noise / (noise.abs().max().clamp(min=EPSILON))
+        return tape_noise(audio, snr_db=args.snr, noise=noise)
+
     else:
         raise ValueError(f"Unknown model: {model}")
+
+
+def _load_noise_files(noise_dir: str, noise_ext: str) -> list:
+    """Return list of noise file paths from a directory (recursive)."""
+    return sorted(Path(noise_dir).rglob(f"*.{noise_ext}"))
 
 
 def main():
@@ -103,7 +131,8 @@ def main():
     parser.add_argument("--output", required=True,
                         help="Output directory")
     parser.add_argument("--model", required=True,
-                        choices=["tanh", "hard_clipping", "ja", "wow_flutter", "ja_wf"],
+                        choices=["tanh", "hard_clipping", "ja", "wow_flutter", "ja_wf",
+                                 "tape_noise"],
                         help="Degradation model")
     parser.add_argument("--ext", default=None,
                         help="Extension filter when input is a directory (e.g. mp3, wav)")
@@ -126,6 +155,15 @@ def main():
     parser.add_argument("--interpolation", default="linear",
                         choices=["linear", "lagrange3"],
                         help="Delay interpolation method. Default: linear")
+    # tape_noise parameters
+    parser.add_argument("--snr", type=float, default=20.0,
+                        help="Target SNR in dB (tape_noise model). Default: 20.0")
+    parser.add_argument("--noise_dir", default=None,
+                        help="Directory of MagTapeDB noise files (tape_noise model)")
+    parser.add_argument("--noise_file", default=None,
+                        help="Single noise file to use (tape_noise model)")
+    parser.add_argument("--noise_ext", default="wav",
+                        help="Noise file extension when using --noise_dir. Default: wav")
 
     # Output
     parser.add_argument("--fade", action="store_true",
@@ -140,6 +178,30 @@ def main():
 
     global SAMPLE_RATE
     SAMPLE_RATE = args.sample_rate
+
+    # Pre-load noise files for tape_noise model
+    args._noise_clip = None
+    noise_files = []
+    if args.model == "tape_noise":
+        if args.noise_file:
+            noise_files = [Path(args.noise_file)]
+        elif args.noise_dir:
+            noise_files = _load_noise_files(args.noise_dir, args.noise_ext)
+        if not noise_files:
+            print("Error: --noise_dir or --noise_file required for tape_noise model.")
+            sys.exit(1)
+        print(f"Noise files : {len(noise_files)}")
+        # Load all noise into a list of tensors (they're small)
+        noise_clips = []
+        for nf in noise_files:
+            n, sr = torchaudio.load(str(nf))
+            if n.shape[0] > 1:
+                n = n.mean(dim=0, keepdim=True)
+            if sr != args.sample_rate:
+                n = torchaudio.functional.resample(n, sr, args.sample_rate)
+            noise_clips.append(n)
+        # Concatenate all noise into one long tensor for easy random seeking
+        args._noise_clip = torch.cat(noise_clips, dim=-1)
 
     input_path = Path(args.input)
     output_dir = Path(args.output)
@@ -170,6 +232,8 @@ def main():
         print(f"Depth : {args.depth}")
         rate_val = args.wow_rate if args.model == "wow_flutter" else args.rate
         print(f"Rate  : {rate_val}")
+    if args.model == "tape_noise":
+        print(f"SNR   : {args.snr} dB")
     print(f"Files : {len(files)}")
     print()
 

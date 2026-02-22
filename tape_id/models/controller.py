@@ -52,28 +52,28 @@ class ParameterController(nn.Module):
             self.trunk = nn.Sequential(
                 nn.Linear(embed_dim, hidden_dim),
                 nn.LeakyReLU(0.01),
-                nn.Dropout(0.3),
+                nn.Dropout(0.1),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.LeakyReLU(0.01),
-                nn.Dropout(0.3),
+                nn.Dropout(0.1),
             )
-            self.head_ja = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
-            self.head_depth = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
-            self.head_rate = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
+            self.head_ja = nn.Linear(hidden_dim, 1)
+            self.head_depth = nn.Linear(hidden_dim, 1)
+            self.head_rate = nn.Linear(hidden_dim, 1)
         elif self.multi_param:
             self.num_classes_depth = num_classes_depth
             self.num_classes_rate = num_classes_rate
             self.trunk = nn.Sequential(
                 nn.Linear(embed_dim, hidden_dim),
                 nn.LeakyReLU(0.01),
-                nn.Dropout(0.3),
+                nn.Dropout(0.1),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.LeakyReLU(0.01),
-                nn.Dropout(0.3),
+                nn.Dropout(0.1),
             )
             if regression:
-                self.head_depth = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
-                self.head_rate = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
+                self.head_depth = nn.Linear(hidden_dim, 1)
+                self.head_rate = nn.Linear(hidden_dim, 1)
             else:
                 self.head_depth = nn.Linear(hidden_dim, num_classes_depth)
                 self.head_rate = nn.Linear(hidden_dim, num_classes_rate)
@@ -83,21 +83,20 @@ class ParameterController(nn.Module):
                 self.mlp = nn.Sequential(
                     nn.Linear(embed_dim, hidden_dim),
                     nn.LeakyReLU(0.01),
-                    nn.Dropout(0.3),
+                    nn.Dropout(0.1),
                     nn.Linear(hidden_dim, hidden_dim),
                     nn.LeakyReLU(0.01),
-                    nn.Dropout(0.3),
+                    nn.Dropout(0.1),
                     nn.Linear(hidden_dim, 1),
-                    nn.Sigmoid(),
                 )
             else:
                 self.mlp = nn.Sequential(
                     nn.Linear(embed_dim, hidden_dim),
                     nn.LeakyReLU(0.01),
-                    nn.Dropout(0.3),
+                    nn.Dropout(0.1),
                     nn.Linear(hidden_dim, hidden_dim),
                     nn.LeakyReLU(0.01),
-                    nn.Dropout(0.3),
+                    nn.Dropout(0.1),
                     nn.Linear(hidden_dim, num_classes),
                 )
 
@@ -105,14 +104,14 @@ class ParameterController(nn.Module):
         if self.triple_param:
             h = self.trunk(e_y)
             return {
-                "ja": self.head_ja(h),
+                "ja":    self.head_ja(h),
                 "depth": self.head_depth(h),
-                "rate": self.head_rate(h),
+                "rate":  self.head_rate(h),
             }
         if self.multi_param:
             h = self.trunk(e_y)
             return {
                 "depth": self.head_depth(h),
-                "rate": self.head_rate(h),
+                "rate":  self.head_rate(h),
             }
         return self.mlp(e_y)

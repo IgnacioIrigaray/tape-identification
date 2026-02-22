@@ -30,7 +30,7 @@ from tape_id.models.encoder import SpectralEncoder
 from tape_id.models.controller import ParameterController
 from tape_id.models.tape_processor import DifferentiableForwardModel
 from tape_id.training.losses import MultiResolutionSTFTLoss
-from tape_id.data.dataset import hard_clipping, tape_saturation, ja_saturation, wow_flutter
+from tape_id.data.dataset import hard_clipping, tape_saturation, ja_saturation, wow_flutter, tape_noise
 from tape_id.utils import split_dataset, conform_length, linear_fade
 
 
@@ -136,8 +136,16 @@ def _load_and_prepare_audio(fpath, sample_rate, audio_length):
     return audio
 
 
-def _apply_degradation(x, param, config, wow_rate_override=None):
-    """Apply the configured degradation to audio."""
+def _apply_degradation(x, param, config, wow_rate_override=None, noise_bank=None):
+    """Apply the configured degradation to audio.
+
+    Args:
+        x:               Audio tensor [1, samples].
+        param:           Degradation parameter value (physical scale).
+        config:          Experiment config dict.
+        wow_rate_override: Override wow rate for wow_flutter model.
+        noise_bank:      Concatenated noise tensor [1, N] for tape_noise model.
+    """
     model = config["degradation_model"]
     sample_rate = config["sample_rate"]
 
@@ -158,6 +166,15 @@ def _apply_degradation(x, param, config, wow_rate_override=None):
         return hard_clipping(x, param)
     elif model == "ja":
         return ja_saturation(x, param, sample_rate=sample_rate)
+    elif model == "tape_noise":
+        if noise_bank is None:
+            raise ValueError("tape_noise requires noise_bank; pass --noise_dir to evaluate.py")
+        length = x.shape[-1]
+        max_start = noise_bank.shape[-1] - length
+        start = random.randint(0, max_start) if max_start > 0 else 0
+        n = noise_bank[:, start:start + length]
+        n = n / (n.abs().max().clamp(min=1e-8))
+        return tape_noise(x, param, n)
     else:
         return tape_saturation(x, param)
 
@@ -343,9 +360,9 @@ def evaluate_triple_param(encoder, controller, test_files, config, device,
             y_in = y.unsqueeze(0).to(device)
             pred = controller(encoder(y_in))
 
-            pred_ja = pred["ja"].item() * (max_ja - min_ja) + min_ja
-            pred_d = pred["depth"].item() * (max_d - min_d) + min_d
-            pred_r = pred["rate"].item() * (max_r - min_r) + min_r
+            pred_ja = torch.clamp(pred["ja"],    0.0, 1.0).item() * (max_ja - min_ja) + min_ja
+            pred_d  = torch.clamp(pred["depth"], 0.0, 1.0).item() * (max_d  - min_d)  + min_d
+            pred_r  = torch.clamp(pred["rate"],  0.0, 1.0).item() * (max_r  - min_r)  + min_r
 
             all_true["ja"].append(ja_val)
             all_true["depth"].append(depth_val)
@@ -360,7 +377,12 @@ def evaluate_triple_param(encoder, controller, test_files, config, device,
 
             if use_signal_loss:
                 x_in = x.unsqueeze(0).to(device)  # [1, 1, L]
-                y_rec = forward_model(x_in, pred)
+                pred_norm = {
+                    "ja":    torch.clamp(pred["ja"],    0.0, 1.0),
+                    "depth": torch.clamp(pred["depth"], 0.0, 1.0),
+                    "rate":  torch.clamp(pred["rate"],  0.0, 1.0),
+                }
+                y_rec = forward_model(x_in, pred_norm)
                 sig_loss = signal_loss_fn(y_rec.squeeze(1), y_in.squeeze(1))
                 accum_sig_loss += sig_loss.item()
 
@@ -419,13 +441,18 @@ def evaluate_triple_param(encoder, controller, test_files, config, device,
 
 def evaluate_regression(encoder, controller, test_files, config, device,
                         plot_path=None, epoch=None, plot_every=25,
-                        forward_model=None, signal_loss_fn=None):
+                        forward_model=None, signal_loss_fn=None,
+                        noise_bank=None):
     """Evaluate single-param regression."""
     sample_rate = config["sample_rate"]
     audio_length = config["audio_length"]
     min_p = config["min_param"]
     max_p = config["max_param"]
     param_range = max_p - min_p
+
+    # Headroom: sample data from [min_data, max_data] but normalize with [min_p, max_p]
+    min_data = config.get("min_data", min_p)
+    max_data = config.get("max_data", max_p)
 
     all_true, all_pred = [], []
     accum_ae, accum_sig_loss, count = 0.0, 0.0, 0
@@ -435,16 +462,16 @@ def evaluate_regression(encoder, controller, test_files, config, device,
     with torch.no_grad():
         for fpath in pbar:
             audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
-            param = random.uniform(min_p, max_p)
+            param = random.uniform(min_data, max_data)
 
             x = audio.unsqueeze(0)
-            audio_deg = _apply_degradation(x, param, config)
+            audio_deg = _apply_degradation(x, param, config, noise_bank=noise_bank)
             audio_deg = conform_length(audio_deg, audio_length)
             audio_deg = linear_fade(audio_deg, sample_rate=sample_rate)
 
             y = audio_deg.unsqueeze(0).to(device)
-            pred_tensor = controller(encoder(y))  # [1, 1]
-            pred_norm = pred_tensor.item()
+            pred_tensor = controller(encoder(y))  # [1, 1]  raw logit
+            pred_norm = torch.sigmoid(pred_tensor).item()
 
             pred_val = pred_norm * param_range + min_p
             all_true.append(param)
@@ -454,7 +481,7 @@ def evaluate_regression(encoder, controller, test_files, config, device,
 
             if use_signal_loss:
                 x_in = x.unsqueeze(0).to(device)  # [1, 1, L]
-                y_rec = forward_model(x_in, pred_tensor)
+                y_rec = forward_model(x_in, torch.sigmoid(pred_tensor))
                 sig_loss = signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
                 accum_sig_loss += sig_loss.item()
 
@@ -475,11 +502,11 @@ def evaluate_regression(encoder, controller, test_files, config, device,
 
     true_arr = np.array(all_true)
     pred_arr = np.array(all_pred)
-    metrics = compute_regression_metrics(true_arr, pred_arr, min_p, max_p)
+    metrics = compute_regression_metrics(true_arr, pred_arr, min_data, max_data)
 
     print("=" * 60)
     print(f"Regression results ({len(all_true)} samples)")
-    print_regression_metrics(metrics, config["degradation_model"], min_p, max_p)
+    print_regression_metrics(metrics, config["degradation_model"], min_data, max_data)
 
     if use_signal_loss and count > 0:
         print(f"\n  Signal loss (MR-STFT): {accum_sig_loss / count:.4f}")
@@ -614,6 +641,11 @@ def main():
     parser.add_argument("--signal_loss", action="store_true",
                         help="Compute MR-STFT signal loss (regression modes only). "
                              "Auto-enabled if signal_loss_weight > 0 in config.")
+    parser.add_argument("--noise_dir", type=str, default=None,
+                        help="Path to MagTapeDB noise directory (required for tape_noise model). "
+                             "Auto-loaded from config if noise_dir is set.")
+    parser.add_argument("--noise_ext", type=str, default=None,
+                        help="Noise file extension. Defaults to config noise_ext or 'wav'.")
     args = parser.parse_args()
 
     # Resolve config and checkpoint paths
@@ -681,6 +713,33 @@ def main():
         )
         print("Signal loss (MR-STFT): enabled")
 
+    # Load noise bank for tape_noise model
+    noise_bank = None
+    if degradation_model == "tape_noise":
+        noise_dir = args.noise_dir or config.get("noise_dir")
+        noise_ext = args.noise_ext or config.get("noise_ext", "wav")
+        if noise_dir is None:
+            raise ValueError("tape_noise model requires --noise_dir or noise_dir in config")
+        noise_train_frac = config.get("noise_train_frac", 0.8)
+        # Collect and split noise files (test split)
+        noise_filepaths = sorted(Path(noise_dir).rglob(f"*.{noise_ext}"))
+        noise_filepaths = [str(p) for p in noise_filepaths]
+        rng = random.Random(42)
+        rng.shuffle(noise_filepaths)
+        noise_test_files = split_dataset(noise_filepaths, "test", noise_train_frac)
+        print(f"Noise files (test split): {len(noise_test_files)}")
+        noise_clips = []
+        sample_rate_cfg = config["sample_rate"]
+        for nf in noise_test_files:
+            n, sr = torchaudio.load(nf)
+            if n.shape[0] > 1:
+                n = n.mean(dim=0, keepdim=True)
+            if sr != sample_rate_cfg:
+                n = torchaudio.functional.resample(n, sr, sample_rate_cfg)
+            noise_clips.append(n)
+        noise_bank = torch.cat(noise_clips, dim=-1)
+        print(f"Noise bank: {noise_bank.shape[-1] / sample_rate_cfg:.1f} s")
+
     # Get test files
     test_files = get_test_files(
         config["audio_dir"],
@@ -713,7 +772,8 @@ def main():
         plot_data = evaluate_regression(encoder, controller, test_files, config, args.device,
                                         plot_path=plot_path, epoch=epoch,
                                         forward_model=forward_model,
-                                        signal_loss_fn=signal_loss_fn)
+                                        signal_loss_fn=signal_loss_fn,
+                                        noise_bank=noise_bank)
     elif multi_param:
         plot_data = evaluate_multi_param(encoder, controller, test_files, config, args.device)
     else:

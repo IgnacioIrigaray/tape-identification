@@ -4,6 +4,14 @@ Dataset for tape saturation parameter identification.
 Generates pairs (y, target) where:
 - y = degradation(audio, random_param)
 - target = the parameter value (normalized to [0,1] for regression, class index for classification)
+
+Degradation models:
+    tanh          Tanh saturation
+    hard_clipping Hard clipping
+    ja            Jiles-Atherton hysteresis (RK4, numba)
+    wow_flutter   Wow + flutter (variable delay)
+    ja_wf         JA + wow/flutter (triple-param)
+    tape_noise    Additive tape noise from MagTapeDB at a given SNR [dB]
 """
 
 import gc
@@ -319,6 +327,30 @@ def _variable_delay(x: torch.Tensor, delay_samples: torch.Tensor,
     return y.unsqueeze(0)
 
 
+def tape_noise(x: torch.Tensor, snr_db: float, noise: torch.Tensor) -> torch.Tensor:
+    """Add tape noise at a target SNR.
+
+    Computes RMS powers of signal and noise and scales the noise so that the
+    mixture has the requested signal-to-noise ratio.
+
+    Args:
+        x:      Clean audio tensor [1, samples].
+        snr_db: Target SNR in dB. Lower = noisier (e.g. 10 dB = heavy noise,
+                40 dB = barely audible hiss).
+        noise:  Noise tensor [1, samples], same length as x. Peak-normalised
+                to 1.0 by the caller so that the RMS computation is stable.
+
+    Returns:
+        Noisy audio [1, samples].
+    """
+    p_signal = (x ** 2).mean().clamp(min=EPSILON)
+    p_noise = (noise ** 2).mean().clamp(min=EPSILON)
+    snr_linear = 10.0 ** (snr_db / 10.0)
+    scale = (p_signal / (p_noise * snr_linear)).sqrt()
+    y = x + scale * noise
+    return y / y.abs().max().clamp(min=EPSILON)
+
+
 def wow_flutter(x: torch.Tensor, depth: float, sample_rate: int = 22050,
                 wow_rate: float = 0.4, flutter_rate: float = 0.5,
                 enable_ou: bool = True, interpolation: str = "linear") -> torch.Tensor:
@@ -360,8 +392,8 @@ def wow_flutter(x: torch.Tensor, depth: float, sample_rate: int = 22050,
 class TapeSaturationDataset(torch.utils.data.Dataset):
     """Dataset that applies audio degradation on-the-fly for parameter identification.
 
-    Supports multiple degradation models (tanh, hard_clipping, ja, wow_flutter, ja_wf)
-    and both classification and regression modes.
+    Supports multiple degradation models (tanh, hard_clipping, ja, wow_flutter, ja_wf,
+    tape_noise) and both classification and regression modes.
 
     Args:
         audio_dir: Directory with audio files.
@@ -371,11 +403,18 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         min_param: Minimum parameter value.
         max_param: Maximum parameter value.
         num_classes: Number of discrete classes (classification mode).
-        degradation_model: One of "tanh", "hard_clipping", "ja", "wow_flutter", "ja_wf".
+        degradation_model: One of "tanh", "hard_clipping", "ja", "wow_flutter", "ja_wf",
+            "tape_noise".
         regression: If True, continuous parameter prediction in [0, 1].
         buffer_size_gb: GB of audio to keep in RAM.
         buffer_reload_rate: Examples between buffer reloads.
         sample_rate: Target sample rate.
+        noise_dir: Directory with MagTapeDB noise recordings (required for tape_noise).
+        noise_input_dirs: Subdirectories inside noise_dir to search.
+        noise_ext: Extension of noise files. Default "wav".
+        noise_train_frac: Train fraction for noise split. Default 0.8.
+        noise_buffer_size_gb: GB of noise audio to keep in RAM. Default 0.5.
+        noise_buffer_reload_rate: Noise examples between buffer reloads. Default 1000.
     """
 
     def __init__(
@@ -412,6 +451,16 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         min_rate: Optional[float] = None,
         max_rate: Optional[float] = None,
         return_clean: bool = False,
+        # Tape noise (MagTapeDB)
+        noise_dir: Optional[str] = None,
+        noise_input_dirs: Optional[List[str]] = None,
+        noise_ext: str = "wav",
+        noise_train_frac: float = 0.8,
+        noise_buffer_size_gb: float = 0.5,
+        noise_buffer_reload_rate: int = 1000,
+        noise_preload: bool = False,
+        min_data: Optional[float] = None,
+        max_data: Optional[float] = None,
     ):
         super().__init__()
         self.return_clean = return_clean
@@ -430,6 +479,8 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         self.regression = regression
         self.min_param = min_param
         self.max_param = max_param
+        self.min_data = min_data if min_data is not None else min_param
+        self.max_data = max_data if max_data is not None else max_param
         self.target_sample_rate = sample_rate
 
         # Wow/flutter config
@@ -487,6 +538,47 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         self.items_since_load = self.buffer_reload_rate
         self.input_files_loaded = {}
 
+        # Noise buffer (tape_noise model only)
+        self.noise_buffer_size_gb = noise_buffer_size_gb
+        self.noise_buffer_reload_rate = noise_buffer_reload_rate
+        self.noise_files = {}
+        self.noise_files_loaded = {}
+        self.noise_items_since_load = noise_buffer_reload_rate  # trigger load on first access
+
+        if degradation_model == "tape_noise":
+            if noise_dir is None:
+                raise ValueError("tape_noise model requires noise_dir (path to MagTapeDB)")
+            noise_filepaths = self._discover_files(noise_dir, noise_input_dirs, noise_ext)
+            rng_noise = random.Random(42)
+            rng_noise.shuffle(noise_filepaths)
+            noise_filepaths = utils.split_dataset(noise_filepaths, subset, noise_train_frac)
+
+            if noise_preload:
+                print(f"\nPreloading {len(noise_filepaths)} noise files into RAM...")
+                for filepath in tqdm(noise_filepaths, ncols=80):
+                    file_id = os.path.basename(filepath)
+                    af = AudioFile(filepath, preload=True, half=half,
+                                   target_sample_rate=self.target_sample_rate)
+                    self.noise_files[file_id] = af
+                    self.noise_files_loaded[file_id] = af
+
+                nbytes = sum(af.audio.element_size() * af.audio.nelement()
+                             for af in self.noise_files.values())
+                print(f"Loaded {len(self.noise_files)} noise files ({nbytes / 1e9:.2f} GB)")
+                self.noise_items_since_load = 0
+                self.noise_buffer_reload_rate = float("inf")
+            else:
+                print(f"\nLoading noise metadata for {len(noise_filepaths)} files...")
+                for filepath in tqdm(noise_filepaths, ncols=80):
+                    file_id = os.path.basename(filepath)
+                    af = AudioFile(filepath, preload=False, half=half,
+                                   target_sample_rate=self.target_sample_rate)
+                    self.noise_files[file_id] = af
+                print(f"Found {len(self.noise_files)} noise files for {subset}")
+
+            if len(self.noise_files) < 1:
+                raise RuntimeError(f"No noise files found in {noise_dir}")
+
     def _setup_triple_param(self, min_param, max_param, min_depth, max_depth, min_rate, max_rate):
         """Configure triple-param mode: JA drive + WF depth + WF rate."""
         self.min_ja = min_param
@@ -521,6 +613,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         model_names = {
             "ja": "Jiles-Atherton", "tanh": "tanh",
             "hard_clipping": "Hard Clipping", "wow_flutter": "Wow/Flutter",
+            "tape_noise": "Tape Noise (SNR dB)",
         }
         name = model_names.get(degradation_model, degradation_model)
         if regression:
@@ -604,6 +697,66 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         x = x / (x.abs().max() + EPSILON)
         return x
 
+    def load_noise_buffer(self):
+        """Load a subset of noise files into RAM."""
+        for file_id in self.noise_files_loaded:
+            af = self.noise_files[file_id]
+            af.audio = None
+            af.loaded = False
+        self.noise_files_loaded = {}
+        gc.collect()
+        self.noise_items_since_load = 0
+        nbytes_loaded = 0
+        max_bytes = self.noise_buffer_size_gb * 1e9
+
+        file_ids = list(self.noise_files.keys())
+        random.shuffle(file_ids)
+        for file_id in file_ids:
+            af = self.noise_files[file_id]
+            if not af.loaded:
+                af.load()
+            self.noise_files_loaded[file_id] = af
+            nbytes_loaded += af.audio.element_size() * af.audio.nelement()
+            if nbytes_loaded >= max_bytes:
+                break
+
+        print(f"Loaded {len(self.noise_files_loaded)} noise files into buffer "
+              f"({nbytes_loaded / 1e9:.2f} GB)")
+
+    def _get_random_noise(self, length: int) -> torch.Tensor:
+        """Get a random noise patch from the noise buffer, tiling if needed."""
+        self.noise_items_since_load += 1
+        if self.noise_items_since_load > self.noise_buffer_reload_rate:
+            self.load_noise_buffer()
+
+        file_ids = list(self.noise_files_loaded.keys())
+        file_id = random.choice(file_ids)
+        af = self.noise_files_loaded[file_id]
+        if not af.loaded:
+            af.load()
+
+        # Convert to mono, float32
+        n = af.audio
+        if n.shape[0] > 1:
+            n = n.mean(dim=0, keepdim=True)
+        n = n.view(1, -1)
+        if self.half:
+            n = n.float()
+
+        # Tile if noise clip is shorter than needed
+        if n.shape[-1] < length:
+            repeats = (length // n.shape[-1]) + 1
+            n = n.repeat(1, repeats)
+
+        # Random start offset
+        max_start = n.shape[-1] - length
+        start = random.randint(0, max_start) if max_start > 0 else 0
+        n = n[:, start:start + length].clone()
+
+        # Peak-normalise for numerical stability (tape_noise() handles SNR scaling)
+        n = n / (n.abs().max().clamp(min=EPSILON))
+        return n
+
     def __getitem__(self, idx):
         x = self._get_random_audio()
 
@@ -676,13 +829,17 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
     def _apply_single_param(self, x: torch.Tensor):
         """Apply single-param degradation, return (y, target)."""
         if self.regression:
-            param = random.uniform(self.min_param, self.max_param)
+            param = random.uniform(self.min_data, self.max_data)
             target = (param - self.min_param) / (self.max_param - self.min_param)
         else:
             class_idx = random.randint(0, self.num_classes - 1)
             param = self.param_values[class_idx]
 
-        y = self._apply_degradation(x, param)
+        if self.degradation_model == "tape_noise":
+            noise = self._get_random_noise(x.shape[-1])
+            y = tape_noise(x, param, noise)
+        else:
+            y = self._apply_degradation(x, param)
         y = utils.conform_length(y, self.length)
         y = utils.linear_fade(y, sample_rate=self.sample_rate)
 

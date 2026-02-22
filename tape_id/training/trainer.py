@@ -43,6 +43,8 @@ class TapeIdentificationTrainer:
         signal_loss_weight: float = 0.0,
         param_loss_weight: float = 1.0,
         signal_loss_fn: nn.Module = None,
+        min_param: float = 0.0,
+        max_param: float = 1.0,
     ):
         self.encoder = encoder.to(device)
         self.controller = controller.to(device)
@@ -59,6 +61,11 @@ class TapeIdentificationTrainer:
         self.triple_param = getattr(controller, 'triple_param', False)
         self.multi_param = getattr(controller, 'multi_param', False)
         self.regression = getattr(controller, 'regression', False)
+
+        # Param range for dB-space regression (sigmoid → scale → MSE in dB)
+        self.min_param = min_param
+        self.max_param = max_param
+        self.param_range = max_param - min_param
 
         # Loss function
         self.loss_fn = nn.MSELoss() if self.regression else nn.CrossEntropyLoss()
@@ -131,7 +138,12 @@ class TapeIdentificationTrainer:
                     + self.loss_fn(pred["rate"], target_r))
 
             if self.use_signal_loss and x_clean is not None:
-                y_rec = self.forward_model(x_clean, pred)
+                pred_norm = {
+                    "ja":    torch.clamp(pred["ja"],    0.0, 1.0),
+                    "depth": torch.clamp(pred["depth"], 0.0, 1.0),
+                    "rate":  torch.clamp(pred["rate"],  0.0, 1.0),
+                }
+                y_rec = self.forward_model(x_clean, pred_norm)
                 sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
                 loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
 
@@ -158,7 +170,11 @@ class TapeIdentificationTrainer:
             loss = self.loss_fn(pred["depth"], target_d) + self.loss_fn(pred["rate"], target_r)
 
             if self.use_signal_loss and x_clean is not None:
-                y_rec = self.forward_model(x_clean, pred)
+                pred_norm = {
+                    "depth": torch.clamp(pred["depth"], 0.0, 1.0),
+                    "rate":  torch.clamp(pred["rate"],  0.0, 1.0),
+                }
+                y_rec = self.forward_model(x_clean, pred_norm)
                 sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
                 loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
 
@@ -177,16 +193,21 @@ class TapeIdentificationTrainer:
             y = y.to(self.device)
             target = target.to(self.device).unsqueeze(1)
 
-            pred = self.controller(self.encoder(y))
-            loss = self.loss_fn(pred, target)
+            raw = self.controller(self.encoder(y))
+            pred_norm = torch.sigmoid(raw)
+
+            # Predict and compute loss in dB space
+            pred_dB = pred_norm * self.param_range + self.min_param
+            target_dB = target * self.param_range + self.min_param
+            loss = self.loss_fn(pred_dB, target_dB)
 
             if self.use_signal_loss and x_clean is not None:
-                y_rec = self.forward_model(x_clean, pred)
+                y_rec = self.forward_model(x_clean, pred_norm)
                 sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
                 loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
 
             n = target.size(0)
-            diff = pred - target
+            diff = pred_dB - target_dB
             return loss, {
                 "ae": (diff.abs().sum().item(), n),
                 "se": ((diff ** 2).sum().item(), n),
@@ -400,13 +421,7 @@ class TapeIdentificationTrainer:
             self.load_checkpoint(resume_from)
             start_epoch = self.current_epoch
         else:
-            # Preserve best_val_loss from existing best model
-            best_path = self.output_dir / "best_model.pt"
-            if best_path.exists():
-                prev = torch.load(str(best_path), map_location="cpu")
-                prev_loss = prev.get("best_val_loss", float("inf"))
-                self.best_val_loss = prev_loss
-                logging.info(f"Preserving previous best_val_loss={prev_loss:.4f}")
+            pass  # Fresh start: best_val_loss stays at float("inf") → first epoch always saves
 
         max_consecutive_errors = 3
 

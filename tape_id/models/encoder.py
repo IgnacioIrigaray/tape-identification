@@ -8,10 +8,10 @@ import torch
 
 from .mobilenetv2 import MobileNetV2
 
-# Normalization constants computed from DeepAFx-ST training data (mean/std of
-# power-compressed STFT magnitudes across the full dataset).
-_SPEC_MEAN = 0.322970
-_SPEC_STD = 0.278452
+# Normalization constants for log-magnitude STFT (dB), computed from 200
+# peak-normalized Jamendo clips (n_fft=4096, hop=2048, floor=-80 dB).
+_SPEC_MEAN = -10.0
+_SPEC_STD = 19.4
 
 
 class SpectralEncoder(torch.nn.Module):
@@ -62,7 +62,8 @@ class SpectralEncoder(torch.nn.Module):
             window=self.window,
             return_complex=True,
         )
-        X_db = torch.pow(X.abs() + 1e-8, 0.3)
+        X_db = 20.0 * torch.log10(X.abs() + 1e-8)
+        X_db = torch.clamp(X_db, min=-80.0)
 
         X_db_norm = (X_db - _SPEC_MEAN) / _SPEC_STD
         # [batch, 1, freq, time] -> [batch, 1, time, freq]
