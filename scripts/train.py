@@ -230,6 +230,7 @@ def main():
     encoder = SpectralEncoder(
         num_params=1,
         sample_rate=config["sample_rate"],
+        encoder_model=config.get("encoder_model", "mobilenet_v2"),
         embed_dim=config["embed_dim"],
         width_mult=2,
     )

@@ -10,7 +10,7 @@ ext: mp3
 # Noise source (MagTapeDB)
 noise_dir: /mnt/data/working_datasets/MagTapeDB/tape_noise
 noise_ext: wav
-noise_train_frac: 0.8 #0.8
+noise_train_frac: 0.9 #0.8
 noise_preload: true             # load all noise files into RAM at startup
 noise_buffer_size_gb: 1         # ignored when noise_preload=true
 noise_buffer_reload_rate: 500   # ignored when noise_preload=true
@@ -25,6 +25,7 @@ buffer_size_gb: 5
 buffer_reload_rate: 5000
 
 # Model
+encoder_model: efficient_net    # mobilenet_v2 or efficient_net
 embed_dim: 1024
 hidden_dim: 256
 degradation_model: tape_noise
