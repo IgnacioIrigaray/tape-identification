@@ -362,9 +362,9 @@ def evaluate_triple_param(encoder, controller, test_files, config, device,
             y_in = y.unsqueeze(0).to(device)
             pred = controller(encoder(y_in))
 
-            pred_ja = torch.clamp(pred["ja"],    0.0, 1.0).item() * (max_ja - min_ja) + min_ja
-            pred_d  = torch.clamp(pred["depth"], 0.0, 1.0).item() * (max_d  - min_d)  + min_d
-            pred_r  = torch.clamp(pred["rate"],  0.0, 1.0).item() * (max_r  - min_r)  + min_r
+            pred_ja = torch.sigmoid(pred["ja"]).item() * (max_ja - min_ja) + min_ja
+            pred_d  = torch.sigmoid(pred["depth"]).item() * (max_d  - min_d)  + min_d
+            pred_r  = torch.sigmoid(pred["rate"]).item() * (max_r  - min_r)  + min_r
 
             all_true["ja"].append(ja_val)
             all_true["depth"].append(depth_val)
@@ -380,9 +380,9 @@ def evaluate_triple_param(encoder, controller, test_files, config, device,
             if use_signal_loss:
                 x_in = x.unsqueeze(0).to(device)  # [1, 1, L]
                 pred_norm = {
-                    "ja":    torch.clamp(pred["ja"],    0.0, 1.0),
-                    "depth": torch.clamp(pred["depth"], 0.0, 1.0),
-                    "rate":  torch.clamp(pred["rate"],  0.0, 1.0),
+                    "ja":    torch.sigmoid(pred["ja"]),
+                    "depth": torch.sigmoid(pred["depth"]),
+                    "rate":  torch.sigmoid(pred["rate"]),
                 }
                 y_rec = forward_model(x_in, pred_norm)
                 sig_loss = signal_loss_fn(y_rec.squeeze(1), y_in.squeeze(1))

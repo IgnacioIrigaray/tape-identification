@@ -45,6 +45,10 @@ class TapeIdentificationTrainer:
         signal_loss_fn: nn.Module = None,
         min_param: float = 0.0,
         max_param: float = 1.0,
+        min_depth: float = 0.0,
+        max_depth: float = 1.0,
+        min_rate: float = 0.0,
+        max_rate: float = 1.0,
     ):
         self.encoder = encoder.to(device)
         self.controller = controller.to(device)
@@ -62,10 +66,16 @@ class TapeIdentificationTrainer:
         self.multi_param = getattr(controller, 'multi_param', False)
         self.regression = getattr(controller, 'regression', False)
 
-        # Param range for dB-space regression (sigmoid → scale → MSE in dB)
+        # Param ranges for scaled-space regression (sigmoid → scale → MSE)
         self.min_param = min_param
         self.max_param = max_param
         self.param_range = max_param - min_param
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.depth_range = max_depth - min_depth
+        self.min_rate = min_rate
+        self.max_rate = max_rate
+        self.rate_range = max_rate - min_rate
 
         # Loss function
         self.loss_fn = nn.MSELoss() if self.regression else nn.CrossEntropyLoss()
@@ -133,24 +143,36 @@ class TapeIdentificationTrainer:
             target_r = target_r.to(self.device).unsqueeze(1)
 
             pred = self.controller(self.encoder(y))
-            loss = (self.loss_fn(pred["ja"], target_ja)
-                    + self.loss_fn(pred["depth"], target_d)
-                    + self.loss_fn(pred["rate"], target_r))
+            pred_ja_norm = torch.sigmoid(pred["ja"])
+            pred_d_norm = torch.sigmoid(pred["depth"])
+            pred_r_norm = torch.sigmoid(pred["rate"])
+
+            # Scale to physical units
+            pred_ja_sc = pred_ja_norm * self.param_range + self.min_param
+            pred_d_sc = pred_d_norm * self.depth_range + self.min_depth
+            pred_r_sc = pred_r_norm * self.rate_range + self.min_rate
+            target_ja_sc = target_ja * self.param_range + self.min_param
+            target_d_sc = target_d * self.depth_range + self.min_depth
+            target_r_sc = target_r * self.rate_range + self.min_rate
+
+            loss = (self.loss_fn(pred_ja_sc, target_ja_sc)
+                    + self.loss_fn(pred_d_sc, target_d_sc)
+                    + self.loss_fn(pred_r_sc, target_r_sc))
 
             if self.use_signal_loss and x_clean is not None:
                 pred_norm = {
-                    "ja":    torch.clamp(pred["ja"],    0.0, 1.0),
-                    "depth": torch.clamp(pred["depth"], 0.0, 1.0),
-                    "rate":  torch.clamp(pred["rate"],  0.0, 1.0),
+                    "ja":    pred_ja_norm,
+                    "depth": pred_d_norm,
+                    "rate":  pred_r_norm,
                 }
                 y_rec = self.forward_model(x_clean, pred_norm)
                 sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
                 loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
 
             n = target_ja.size(0)
-            diff_ja = pred["ja"] - target_ja
-            diff_d = pred["depth"] - target_d
-            diff_r = pred["rate"] - target_r
+            diff_ja = pred_ja_sc - target_ja_sc
+            diff_d = pred_d_sc - target_d_sc
+            diff_r = pred_r_sc - target_r_sc
             return loss, {
                 "ae_ja": (diff_ja.abs().sum().item(), n),
                 "ae_depth": (diff_d.abs().sum().item(), n),
@@ -167,20 +189,28 @@ class TapeIdentificationTrainer:
             target_r = target_r.to(self.device).unsqueeze(1)
 
             pred = self.controller(self.encoder(y))
-            loss = self.loss_fn(pred["depth"], target_d) + self.loss_fn(pred["rate"], target_r)
+            pred_d_norm = torch.sigmoid(pred["depth"])
+            pred_r_norm = torch.sigmoid(pred["rate"])
+
+            pred_d_sc = pred_d_norm * self.depth_range + self.min_depth
+            pred_r_sc = pred_r_norm * self.rate_range + self.min_rate
+            target_d_sc = target_d * self.depth_range + self.min_depth
+            target_r_sc = target_r * self.rate_range + self.min_rate
+
+            loss = self.loss_fn(pred_d_sc, target_d_sc) + self.loss_fn(pred_r_sc, target_r_sc)
 
             if self.use_signal_loss and x_clean is not None:
                 pred_norm = {
-                    "depth": torch.clamp(pred["depth"], 0.0, 1.0),
-                    "rate":  torch.clamp(pred["rate"],  0.0, 1.0),
+                    "depth": pred_d_norm,
+                    "rate":  pred_r_norm,
                 }
                 y_rec = self.forward_model(x_clean, pred_norm)
                 sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
                 loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
 
             n = target_d.size(0)
-            diff_d = pred["depth"] - target_d
-            diff_r = pred["rate"] - target_r
+            diff_d = pred_d_sc - target_d_sc
+            diff_r = pred_r_sc - target_r_sc
             return loss, {
                 "ae_depth": (diff_d.abs().sum().item(), n),
                 "ae_rate": (diff_r.abs().sum().item(), n),
@@ -196,10 +226,10 @@ class TapeIdentificationTrainer:
             raw = self.controller(self.encoder(y))
             pred_norm = torch.sigmoid(raw)
 
-            # Predict and compute loss in dB space
-            pred_dB = pred_norm * self.param_range + self.min_param
-            target_dB = target * self.param_range + self.min_param
-            loss = self.loss_fn(pred_dB, target_dB)
+            # Predict and compute loss in scaled (physical) space
+            pred_scaled = pred_norm * self.param_range + self.min_param
+            target_scaled = target * self.param_range + self.min_param
+            loss = self.loss_fn(pred_scaled, target_scaled)
 
             if self.use_signal_loss and x_clean is not None:
                 y_rec = self.forward_model(x_clean, pred_norm)
@@ -207,7 +237,7 @@ class TapeIdentificationTrainer:
                 loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
 
             n = target.size(0)
-            diff = pred_dB - target_dB
+            diff = pred_scaled - target_scaled
             return loss, {
                 "ae": (diff.abs().sum().item(), n),
                 "se": ((diff ** 2).sum().item(), n),

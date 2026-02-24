@@ -1,8 +1,11 @@
 # Wow & Flutter (variable delay)
 # Estimates depth parameter from wow/flutter degraded audio.
 
-audio_dir: /mnt/data/working_datasets/jamendo
-ext: mp3
+#audio_dir: /mnt/data/working_datasets/jamendo
+#ext: mp3
+#Data guitarset
+audio_dir: /mnt/data/working_datasets/guitarset
+ext: wav
 
 batch_size: 48
 num_workers: 1

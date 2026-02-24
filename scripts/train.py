@@ -107,12 +107,14 @@ def create_controller(config: dict) -> ParameterController:
             regression=regression,
         )
     else:
-        return ParameterController(
-            num_classes=config["num_classes"],
+        kwargs = dict(
             embed_dim=config["embed_dim"],
             hidden_dim=config["hidden_dim"],
             regression=regression,
         )
+        if not regression:
+            kwargs["num_classes"] = config["num_classes"]
+        return ParameterController(**kwargs)
 
 
 def main():
@@ -154,7 +156,7 @@ def main():
         length=config["audio_length"],
         min_param=config["min_param"],
         max_param=config["max_param"],
-        num_classes=config["num_classes"],
+        num_classes=config.get("num_classes", 3),
         degradation_model=config["degradation_model"],
         log_scale=config.get("log_scale", False),
         buffer_size_gb=config["buffer_size_gb"],
@@ -300,6 +302,10 @@ def main():
         signal_loss_fn=signal_loss_fn,
         min_param=config["min_param"],
         max_param=config["max_param"],
+        min_depth=config.get("min_depth", 0.0),
+        max_depth=config.get("max_depth", 1.0),
+        min_rate=config.get("min_rate", 0.0),
+        max_rate=config.get("max_rate", 1.0),
     )
 
     # Auto-resume from last checkpoint
