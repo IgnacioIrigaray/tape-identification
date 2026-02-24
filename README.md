@@ -298,6 +298,20 @@ tape-identification/
         └── config.yaml         # Config copy for reproducibility
 ```
 
+## Datasets
+
+| Dataset | Description | Format | Size | Link |
+|---------|-------------|--------|------|------|
+| [Jamendo](https://github.com/MTG/mtg-jamendo-dataset) | Multi-genre music (pop, rock, electronic, classical) | MP3 | ~1850 files | [MTG Jamendo Dataset](https://github.com/MTG/mtg-jamendo-dataset) |
+| [GuitarSet](https://guitarset.weebly.com/) | Acoustic guitar performances with isolated recordings | WAV | ~360 files | [GuitarSet](https://guitarset.weebly.com/) |
+| [MagTapeDB](https://github.com/IgnacioIrigaray/MagTapeDB) | Magnetic tape noise recordings from various tape machines | WAV | — | [GitHub](https://github.com/IgnacioIrigaray/MagTapeDB) |
+
+- **Jamendo**: Primary training dataset. Varied musical content provides diverse spectral characteristics for robust generalization.
+- **GuitarSet**: Used for cross-domain evaluation. Single-instrument recordings test generalization beyond the training distribution.
+- **MagTapeDB**: Noise source for the `tape_noise` degradation model. Real tape noise recordings mixed at random SNR levels with clean audio.
+
+Data split: 80% train / 10% validation / 10% test (seed=42, deterministic).
+
 ## Audio Format
 
 - Sample rate: 22050 Hz
