@@ -27,11 +27,11 @@ Split: 80% train / 10% val / 10% test (seed=42, deterministico).
 
 | Exp | Degradacion | Tarea | Resultado | Notas |
 |---|---|---|---|---|
-| 1 | HardClipping | Clasif 3 clases | 90.5% acc | Primer baseline funcional |
-| 2 | HardClipping | Clasif 10 clases | 30% acc | Demasiadas clases, estancado |
-| 3 | Wow/Flutter | Clasif 3 clases (rate) | ~88.5% acc | Sin modelo guardado |
+| 1 | HardClipping | Clasif 3 clases | ... % acc | Primer baseline funcional |
+| 2 | HardClipping | Clasif 10 clases | ... % acc | Demasiadas clases, estancado |
+| 3 | Wow/Flutter | Clasif 3 clases (rate) | ... % acc | Sin modelo guardado |
 | 4 | JA + WF | Clasif dual 3x3 | -- | Paso intermedio |
-| 5 | JA + WF | Regresion triple | R2~0 | Problemas de OOM, nunca entreno bien |
+| 5 | JA + WF | Regresion triple | ... | Problemas de OOM, nunca entreno bien |
 
 ---
 

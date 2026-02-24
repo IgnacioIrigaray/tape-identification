@@ -108,7 +108,6 @@ def create_controller(config: dict) -> ParameterController:
         )
     else:
         return ParameterController(
-            num_classes=config["num_classes"],
             embed_dim=config["embed_dim"],
             hidden_dim=config["hidden_dim"],
             regression=regression,
@@ -154,7 +153,6 @@ def main():
         length=config["audio_length"],
         min_param=config["min_param"],
         max_param=config["max_param"],
-        num_classes=config["num_classes"],
         degradation_model=config["degradation_model"],
         log_scale=config.get("log_scale", False),
         buffer_size_gb=config["buffer_size_gb"],
@@ -277,7 +275,6 @@ def main():
         mode="min",
         factor=config.get("scheduler_factor", 0.5),
         patience=config.get("scheduler_patience", 5),
-        verbose=True,
     )
 
     # Create trainer
