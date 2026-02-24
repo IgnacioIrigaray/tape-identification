@@ -77,7 +77,6 @@ class TapeIdentificationTrainer:
         self.signal_loss_fn = signal_loss_fn
         self.use_signal_loss = (
             forward_model is not None
-            and signal_loss_weight > 0.0
             and signal_loss_fn is not None
             and self.regression
         )
@@ -115,7 +114,9 @@ class TapeIdentificationTrainer:
         """Run encoder + controller on batch, compute loss and per-param metrics.
 
         Returns:
-            loss: Scalar loss tensor
+            total_loss: Scalar loss tensor for backward pass (weighted combination)
+            param_loss: Unweighted parameter loss value (scalar)
+            signal_loss: Unweighted signal loss value (scalar)
             metrics: dict of metric_name -> (sum_value, count)
         """
         # When signal loss is enabled, x_clean is prepended to the batch tuple
@@ -125,6 +126,8 @@ class TapeIdentificationTrainer:
         else:
             x_clean = None
 
+        signal_loss = torch.tensor(0.0, device=self.device)
+
         if self.triple_param:
             y, target_ja, target_d, target_r = batch
             y = y.to(self.device)
@@ -133,7 +136,7 @@ class TapeIdentificationTrainer:
             target_r = target_r.to(self.device).unsqueeze(1)
 
             pred = self.controller(self.encoder(y))
-            loss = (self.loss_fn(pred["ja"], target_ja)
+            param_loss = (self.loss_fn(pred["ja"], target_ja)
                     + self.loss_fn(pred["depth"], target_d)
                     + self.loss_fn(pred["rate"], target_r))
 
@@ -144,14 +147,15 @@ class TapeIdentificationTrainer:
                     "rate":  torch.clamp(pred["rate"],  0.0, 1.0),
                 }
                 y_rec = self.forward_model(x_clean, pred_norm)
-                sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
-                loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
+                signal_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
+
+            total_loss = self.param_loss_weight * param_loss + self.signal_loss_weight * signal_loss
 
             n = target_ja.size(0)
             diff_ja = pred["ja"] - target_ja
             diff_d = pred["depth"] - target_d
             diff_r = pred["rate"] - target_r
-            return loss, {
+            return total_loss, param_loss, signal_loss, {
                 "ae_ja": (diff_ja.abs().sum().item(), n),
                 "ae_depth": (diff_d.abs().sum().item(), n),
                 "ae_rate": (diff_r.abs().sum().item(), n),
@@ -167,7 +171,7 @@ class TapeIdentificationTrainer:
             target_r = target_r.to(self.device).unsqueeze(1)
 
             pred = self.controller(self.encoder(y))
-            loss = self.loss_fn(pred["depth"], target_d) + self.loss_fn(pred["rate"], target_r)
+            param_loss = self.loss_fn(pred["depth"], target_d) + self.loss_fn(pred["rate"], target_r)
 
             if self.use_signal_loss and x_clean is not None:
                 pred_norm = {
@@ -175,13 +179,14 @@ class TapeIdentificationTrainer:
                     "rate":  torch.clamp(pred["rate"],  0.0, 1.0),
                 }
                 y_rec = self.forward_model(x_clean, pred_norm)
-                sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
-                loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
+                signal_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
+
+            total_loss = self.param_loss_weight * param_loss + self.signal_loss_weight * signal_loss
 
             n = target_d.size(0)
             diff_d = pred["depth"] - target_d
             diff_r = pred["rate"] - target_r
-            return loss, {
+            return total_loss, param_loss, signal_loss, {
                 "ae_depth": (diff_d.abs().sum().item(), n),
                 "ae_rate": (diff_r.abs().sum().item(), n),
                 "se_depth": ((diff_d ** 2).sum().item(), n),
@@ -199,16 +204,17 @@ class TapeIdentificationTrainer:
             # Predict and compute loss in dB space
             pred_dB = pred_norm * self.param_range + self.min_param
             target_dB = target * self.param_range + self.min_param
-            loss = self.loss_fn(pred_dB, target_dB)
+            param_loss = self.loss_fn(pred_dB, target_dB)
 
             if self.use_signal_loss and x_clean is not None:
                 y_rec = self.forward_model(x_clean, pred_norm)
-                sig_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
-                loss = self.param_loss_weight * loss + self.signal_loss_weight * sig_loss
+                signal_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
+
+            total_loss = self.param_loss_weight * param_loss + self.signal_loss_weight * signal_loss
 
             n = target.size(0)
             diff = pred_dB - target_dB
-            return loss, {
+            return total_loss, param_loss, signal_loss, {
                 "ae": (diff.abs().sum().item(), n),
                 "se": ((diff ** 2).sum().item(), n),
             }
@@ -220,12 +226,13 @@ class TapeIdentificationTrainer:
             rate_idx = rate_idx.to(self.device)
 
             logits = self.controller(self.encoder(y))
-            loss = self.loss_fn(logits["depth"], depth_idx) + self.loss_fn(logits["rate"], rate_idx)
+            param_loss = self.loss_fn(logits["depth"], depth_idx) + self.loss_fn(logits["rate"], rate_idx)
+            total_loss = param_loss
 
             n = depth_idx.size(0)
             preds_d = torch.argmax(logits["depth"], dim=-1)
             preds_r = torch.argmax(logits["rate"], dim=-1)
-            return loss, {
+            return total_loss, param_loss, signal_loss, {
                 "correct_depth": ((preds_d == depth_idx).sum().item(), n),
                 "correct_rate": ((preds_r == rate_idx).sum().item(), n),
                 "correct_both": (((preds_d == depth_idx) & (preds_r == rate_idx)).sum().item(), n),
@@ -237,11 +244,12 @@ class TapeIdentificationTrainer:
             class_idx = class_idx.to(self.device)
 
             logits = self.controller(self.encoder(y))
-            loss = self.loss_fn(logits, class_idx)
+            param_loss = self.loss_fn(logits, class_idx)
+            total_loss = param_loss
 
             n = class_idx.size(0)
             preds = torch.argmax(logits, dim=-1)
-            return loss, {
+            return total_loss, param_loss, signal_loss, {
                 "correct": ((preds == class_idx).sum().item(), n),
             }
 
@@ -292,12 +300,14 @@ class TapeIdentificationTrainer:
         self.controller.train()
 
         total_loss = 0.0
+        param_loss_accum = 0.0
+        signal_loss_accum = 0.0
         accum = {}
         all_params = list(self.encoder.parameters()) + list(self.controller.parameters())
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
 
         for batch in pbar:
-            loss, step_metrics = self._forward_step(batch)
+            loss, param_loss, signal_loss, step_metrics = self._forward_step(batch)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -305,8 +315,13 @@ class TapeIdentificationTrainer:
             self.optimizer.step()
 
             total_loss += loss.item()
+            param_loss_accum += param_loss.item()
+            signal_loss_accum += signal_loss.item()
             self._accumulate_metrics(accum, step_metrics)
-            self.writer.add_scalar("train/loss_step", loss.item(), self.global_step)
+            
+            self.writer.add_scalar("train/loss_total_step", loss.item(), self.global_step)
+            self.writer.add_scalar("train/loss_param_step", param_loss.item(), self.global_step)
+            self.writer.add_scalar("train/loss_signal_step", signal_loss.item(), self.global_step)
             self.global_step += 1
 
             ratios = self._compute_ratios(accum)
@@ -314,7 +329,14 @@ class TapeIdentificationTrainer:
 
         ratios = self._compute_ratios(accum)
         self._log_epoch_metrics("train", ratios, self.current_epoch)
-        return total_loss / len(self.train_loader)
+        
+        # Log average losses for the epoch
+        num_batches = len(self.train_loader)
+        self.writer.add_scalar("train/loss_total_epoch", total_loss / num_batches, self.current_epoch)
+        self.writer.add_scalar("train/loss_param_epoch", param_loss_accum / num_batches, self.current_epoch)
+        self.writer.add_scalar("train/loss_signal_epoch", signal_loss_accum / num_batches, self.current_epoch)
+        
+        return total_loss / num_batches
 
     @torch.no_grad()
     def validate(self) -> float:
@@ -323,16 +345,27 @@ class TapeIdentificationTrainer:
         self.controller.eval()
 
         total_loss = 0.0
+        param_loss_accum = 0.0
+        signal_loss_accum = 0.0
         accum = {}
 
         for batch in tqdm(self.val_loader, desc="Validation"):
-            loss, step_metrics = self._forward_step(batch)
+            loss, param_loss, signal_loss, step_metrics = self._forward_step(batch)
             total_loss += loss.item()
+            param_loss_accum += param_loss.item()
+            signal_loss_accum += signal_loss.item()
             self._accumulate_metrics(accum, step_metrics)
 
-        avg_loss = total_loss / len(self.val_loader)
+        num_batches = len(self.val_loader)
+        avg_loss = total_loss / num_batches
+        avg_param_loss = param_loss_accum / num_batches
+        avg_signal_loss = signal_loss_accum / num_batches
+        
+        self.writer.add_scalar("val/loss_total", avg_loss, self.current_epoch)
+        self.writer.add_scalar("val/loss_param", avg_param_loss, self.current_epoch)
+        self.writer.add_scalar("val/loss_signal", avg_signal_loss, self.current_epoch)
+        
         ratios = self._compute_ratios(accum)
-        self.writer.add_scalar("val/loss", avg_loss, self.current_epoch)
         self._log_epoch_metrics("val", ratios, self.current_epoch)
 
         # Print validation summary
@@ -435,9 +468,8 @@ class TapeIdentificationTrainer:
                     val_loss = self.validate()
                     consecutive_errors = 0
 
-                    self.writer.add_scalar("train/loss_epoch", train_loss, epoch)
                     self.writer.add_scalars("loss_comparison", {
-                        "train": train_loss, "val": val_loss,
+                        "train_total": train_loss, "val_total": val_loss,
                     }, epoch)
 
                     print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
