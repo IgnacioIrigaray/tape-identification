@@ -145,7 +145,7 @@ def main():
     # Determine signal loss settings before dataset creation (return_clean affects batch format)
     signal_loss_weight = config.get("signal_loss_weight", 0.0)
     param_loss_weight = config.get("param_loss_weight", 1.0)
-    use_signal_loss = signal_loss_weight > 0.0 and config.get("regression", False)
+    use_signal_loss = config.get("regression", False)
 
     # Create datasets
     print("\nLoading datasets...")
@@ -279,7 +279,6 @@ def main():
         mode="min",
         factor=config.get("scheduler_factor", 0.5),
         patience=config.get("scheduler_patience", 5),
-        verbose=True,
     )
 
     # Create trainer
