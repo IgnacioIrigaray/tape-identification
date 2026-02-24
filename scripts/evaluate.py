@@ -57,6 +57,7 @@ def load_model(config: dict, checkpoint_path: str, device: str = "cpu"):
         encoder_model=config.get("encoder_model", "mobilenet_v2"),
         embed_dim=config["embed_dim"],
         width_mult=2,
+        multi_resolution=config.get("multi_resolution", False),
     ).to(device)
 
     degradation_model = config.get("degradation_model", "ja")

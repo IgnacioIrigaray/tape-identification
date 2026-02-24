@@ -10,7 +10,7 @@ ext: mp3
 # Noise source (MagTapeDB)
 noise_dir: /mnt/data/working_datasets/MagTapeDB/tape_noise
 noise_ext: wav
-noise_train_frac: 0.9 #0.8
+noise_train_frac: 0.8 #0.8
 noise_preload: true             # load all noise files into RAM at startup
 noise_buffer_size_gb: 1         # ignored when noise_preload=true
 noise_buffer_reload_rate: 500   # ignored when noise_preload=true
@@ -26,6 +26,7 @@ buffer_reload_rate: 5000
 
 # Model
 encoder_model: efficient_net    # mobilenet_v2 or efficient_net
+multi_resolution: false         # 3-channel multi-res STFT (mobilenet_v2 only)
 embed_dim: 1024
 hidden_dim: 256
 degradation_model: tape_noise
@@ -34,7 +35,7 @@ num_classes: 5        # used in classification mode only
 
 # SNR range in dB (lower = more noise)
 min_param: 0 # 5.0        # heavily degraded tape
-max_param: 40 # 30.0       # barely audible hiss
+max_param: 50 # 30.0       # barely audible hiss
 
 # Headroom: data is sampled from [min_data, max_data] but targets are
 # normalized with [min_param, max_param], so predictions never need to
