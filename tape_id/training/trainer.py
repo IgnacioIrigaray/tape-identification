@@ -87,6 +87,7 @@ class TapeIdentificationTrainer:
         self.signal_loss_fn = signal_loss_fn
         self.use_signal_loss = (
             forward_model is not None
+            and signal_loss_weight > 0.0
             and signal_loss_fn is not None
             and self.regression
         )
@@ -130,7 +131,8 @@ class TapeIdentificationTrainer:
             metrics: dict of metric_name -> (sum_value, count)
         """
         # When signal loss is enabled, x_clean is prepended to the batch tuple
-        if self.use_signal_loss:
+        # It must be extracted from the batch so batch_new = (y, target)
+        if not self.use_signal_loss:
             x_clean = batch[0].to(self.device)
             batch = batch[1:]
         else:
@@ -257,11 +259,21 @@ class TapeIdentificationTrainer:
 
             logits = self.controller(self.encoder(y))
             param_loss = self.loss_fn(logits["depth"], depth_idx) + self.loss_fn(logits["rate"], rate_idx)
-            total_loss = param_loss
+
+            if self.use_signal_loss and x_clean is not None:
+                pred_norm = {
+                    "depth": pred_d_norm,
+                    "rate":  pred_r_norm,
+                }
+                y_rec = self.forward_model(x_clean, pred_norm)
+                signal_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
+
+            total_loss = self.param_loss_weight * param_loss + self.signal_loss_weight * signal_loss
 
             n = depth_idx.size(0)
             preds_d = torch.argmax(logits["depth"], dim=-1)
             preds_r = torch.argmax(logits["rate"], dim=-1)
+
             return total_loss, param_loss, signal_loss, {
                 "correct_depth": ((preds_d == depth_idx).sum().item(), n),
                 "correct_rate": ((preds_r == rate_idx).sum().item(), n),
@@ -275,10 +287,20 @@ class TapeIdentificationTrainer:
 
             logits = self.controller(self.encoder(y))
             param_loss = self.loss_fn(logits, class_idx)
-            total_loss = param_loss
 
             n = class_idx.size(0)
             preds = torch.argmax(logits, dim=-1)
+            
+            # Convert predicted class to normalized parameter for signal loss
+            if self.use_signal_loss and x_clean is not None:
+                num_classes = self.controller.num_classes
+                pred_param_norm = preds.float() / (num_classes - 1)
+                pred_param_norm = pred_param_norm.unsqueeze(1)  # [batch] -> [batch, 1]
+                y_rec = self.forward_model(x_clean, pred_param_norm)
+                signal_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
+
+            total_loss = self.param_loss_weight * param_loss + self.signal_loss_weight * signal_loss
+
             return total_loss, param_loss, signal_loss, {
                 "correct": ((preds == class_idx).sum().item(), n),
             }
