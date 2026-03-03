@@ -30,7 +30,10 @@ from tape_id.models.encoder import SpectralEncoder
 from tape_id.models.controller import ParameterController
 from tape_id.models.tape_processor import DifferentiableForwardModel
 from tape_id.training.losses import MultiResolutionSTFTLoss
-from tape_id.data.dataset import hard_clipping, tape_saturation, ja_saturation, wow_flutter, tape_noise
+from tape_id.data.dataset import (
+    hard_clipping, tape_saturation, ja_saturation, wow_flutter, tape_noise,
+    MULTI_PARAM_MODELS,
+)
 from tape_id.utils import split_dataset, conform_length, linear_fade
 
 
@@ -62,13 +65,29 @@ def load_model(config: dict, checkpoint_path: str, device: str = "cpu"):
 
     degradation_model = config.get("degradation_model", "ja")
     regression = config.get("regression", False)
-    triple_param = (degradation_model == "ja_wf")
     wf_target_param = config.get("wf_target_param", "depth")
 
-    if triple_param:
+    # Build param_specs for N-param models
+    param_specs = config.get("param_specs")
+    if param_specs is None and degradation_model in MULTI_PARAM_MODELS:
+        # Build from legacy fields
+        model_info = MULTI_PARAM_MODELS[degradation_model]
+        param_specs = []
+        for name in model_info["params"]:
+            if name == "ja":
+                param_specs.append({"name": "ja", "min": config["min_param"], "max": config["max_param"]})
+            elif name == "depth":
+                param_specs.append({"name": "depth", "min": config.get("min_depth", 0.1), "max": config.get("max_depth", 0.8)})
+            elif name == "rate":
+                param_specs.append({"name": "rate", "min": config.get("min_rate", 0.1), "max": config.get("max_rate", 0.8)})
+            elif name == "snr":
+                param_specs.append({"name": "snr", "min": config["min_param"], "max": config["max_param"]})
+
+    if param_specs is not None:
+        param_names = [s["name"] for s in param_specs]
         controller = ParameterController(
             embed_dim=config["embed_dim"], hidden_dim=config["hidden_dim"],
-            regression=True, triple_param=True,
+            regression=True, param_names=param_names,
         )
     elif wf_target_param == "both":
         controller = ParameterController(
@@ -322,109 +341,83 @@ def save_scatter_plots(results, epoch, output_path):
 # Evaluation loops
 # ---------------------------------------------------------------------------
 
-def evaluate_triple_param(encoder, controller, test_files, config, device,
-                          plot_path=None, epoch=None, plot_every=25,
-                          forward_model=None, signal_loss_fn=None):
-    """Evaluate triple-param regression: JA drive + WF depth + WF rate."""
+def evaluate_n_param(encoder, controller, test_files, config, device,
+                     param_specs, plot_path=None, epoch=None, plot_every=25,
+                     noise_bank=None):
+    """Evaluate N-param regression: generic loop over param_specs and chain steps."""
     sample_rate = config["sample_rate"]
     audio_length = config["audio_length"]
-    min_ja, max_ja = config["min_param"], config["max_param"]
-    min_d, max_d = config["min_depth"], config["max_depth"]
-    min_r, max_r = config["min_rate"], config["max_rate"]
+    degradation_model = config["degradation_model"]
+    model_info = MULTI_PARAM_MODELS[degradation_model]
 
-    all_true = {"ja": [], "depth": [], "rate": []}
-    all_pred = {"ja": [], "depth": [], "rate": []}
-
-    accum_ae = {"ja": 0.0, "depth": 0.0, "rate": 0.0}
-    accum_sig_loss = 0.0
+    param_ranges = {s["name"]: (s["min"], s["max"]) for s in param_specs}
+    all_true = {s["name"]: [] for s in param_specs}
+    all_pred = {s["name"]: [] for s in param_specs}
+    accum_ae = {s["name"]: 0.0 for s in param_specs}
     count = 0
-    use_signal_loss = forward_model is not None and signal_loss_fn is not None
 
     pbar = tqdm(test_files, ncols=80)
     with torch.no_grad():
         for fpath in pbar:
             audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
 
-            ja_val = random.uniform(min_ja, max_ja)
-            depth_val = random.uniform(min_d, max_d)
-            rate_val = random.uniform(min_r, max_r)
+            # Sample random param values
+            vals = {s["name"]: random.uniform(s["min"], s["max"]) for s in param_specs}
 
+            # Apply degradation chain
             x = audio.unsqueeze(0)
-            y = ja_saturation(x, ja_val, sample_rate=sample_rate)
-            y = wow_flutter(y, depth_val, sample_rate=sample_rate,
-                            wow_rate=rate_val,
-                            flutter_rate=config.get("flutter_rate", 0.5),
-                            enable_ou=config.get("enable_ou", True),
-                            interpolation=config.get("wf_interpolation", "linear"))
+            y = x
+            for step in model_info["chain"]:
+                if step == "ja":
+                    y = ja_saturation(y, vals["ja"], sample_rate=sample_rate)
+                elif step == "wow_flutter":
+                    y = wow_flutter(y, vals["depth"], sample_rate=sample_rate,
+                                    wow_rate=vals["rate"],
+                                    flutter_rate=config.get("flutter_rate", 0.5),
+                                    enable_ou=config.get("enable_ou", True),
+                                    interpolation=config.get("wf_interpolation", "linear"))
+                elif step == "tape_noise":
+                    length = y.shape[-1]
+                    max_start = noise_bank.shape[-1] - length
+                    start = random.randint(0, max_start) if max_start > 0 else 0
+                    n = noise_bank[:, start:start + length]
+                    n = n / (n.abs().max().clamp(min=1e-8))
+                    y = tape_noise(y, vals["snr"], n)
+
             y = conform_length(y, audio_length)
             y = linear_fade(y, sample_rate=sample_rate)
 
             y_in = y.unsqueeze(0).to(device)
             pred = controller(encoder(y_in))
 
-            pred_ja = torch.sigmoid(pred["ja"]).item() * (max_ja - min_ja) + min_ja
-            pred_d  = torch.sigmoid(pred["depth"]).item() * (max_d  - min_d)  + min_d
-            pred_r  = torch.sigmoid(pred["rate"]).item() * (max_r  - min_r)  + min_r
-
-            all_true["ja"].append(ja_val)
-            all_true["depth"].append(depth_val)
-            all_true["rate"].append(rate_val)
-            all_pred["ja"].append(pred_ja)
-            all_pred["depth"].append(pred_d)
-            all_pred["rate"].append(pred_r)
-
-            accum_ae["ja"] += abs(ja_val - pred_ja)
-            accum_ae["depth"] += abs(depth_val - pred_d)
-            accum_ae["rate"] += abs(rate_val - pred_r)
-
-            if use_signal_loss:
-                x_in = x.unsqueeze(0).to(device)  # [1, 1, L]
-                pred_norm = {
-                    "ja":    torch.sigmoid(pred["ja"]),
-                    "depth": torch.sigmoid(pred["depth"]),
-                    "rate":  torch.sigmoid(pred["rate"]),
-                }
-                y_rec = forward_model(x_in, pred_norm)
-                sig_loss = signal_loss_fn(y_rec.squeeze(1), y_in.squeeze(1))
-                accum_sig_loss += sig_loss.item()
+            for name, (lo, hi) in param_ranges.items():
+                pred_val = torch.sigmoid(pred[name]).item() * (hi - lo) + lo
+                all_true[name].append(vals[name])
+                all_pred[name].append(pred_val)
+                accum_ae[name] += abs(vals[name] - pred_val)
 
             count += 1
 
             if count > 1:
-                postfix = dict(
-                    ja=f"{accum_ae['ja']/count:.3f}",
-                    d=f"{accum_ae['depth']/count:.3f}",
-                    r=f"{accum_ae['rate']/count:.3f}",
-                )
-                if use_signal_loss:
-                    postfix["sig"] = f"{accum_sig_loss/count:.3f}"
+                postfix = {name[:4]: f"{accum_ae[name]/count:.3f}" for name in param_ranges}
                 pbar.set_postfix(postfix)
 
             if plot_path and count > 1 and count % plot_every == 0:
-                interim = []
-                for name, key, lo, hi in [
-                    ("JA Drive", "ja", min_ja, max_ja),
-                    ("WF Depth", "depth", min_d, max_d),
-                    ("WF Rate", "rate", min_r, max_r),
-                ]:
-                    interim.append((name, np.array(all_true[key]),
-                                    np.array(all_pred[key]), lo, hi))
+                interim = [
+                    (name, np.array(all_true[name]), np.array(all_pred[name]), lo, hi)
+                    for name, (lo, hi) in param_ranges.items()
+                ]
                 save_scatter_plots(interim, epoch, plot_path)
 
-    # Compute and print metrics for each parameter
-    params = [
-        ("JA Drive", "ja", min_ja, max_ja),
-        ("WF Depth", "depth", min_d, max_d),
-        ("WF Rate", "rate", min_r, max_r),
-    ]
+    # Compute and print metrics
     print("=" * 60)
-    print(f"Triple-param regression results ({len(all_true['ja'])} samples)")
+    print(f"N-param regression results ({count} samples, model={degradation_model})")
 
     results_for_plot = []
     summary = []
-    for name, key, lo, hi in params:
-        true_arr = np.array(all_true[key])
-        pred_arr = np.array(all_pred[key])
+    for name, (lo, hi) in param_ranges.items():
+        true_arr = np.array(all_true[name])
+        pred_arr = np.array(all_pred[name])
         metrics = compute_regression_metrics(true_arr, pred_arr, lo, hi)
         print_regression_metrics(metrics, name, lo, hi)
         summary.append((name, metrics["mae"], metrics["r2"]))
@@ -434,9 +427,6 @@ def evaluate_triple_param(encoder, controller, test_files, config, device,
     print(f"  {'Param':>10}  {'MAE':>8}  {'R²':>8}")
     for name, mae, r2 in summary:
         print(f"  {name:>10}  {mae:8.4f}  {r2:8.4f}")
-
-    if use_signal_loss and count > 0:
-        print(f"\n  Signal loss (MR-STFT): {accum_sig_loss / count:.4f}")
 
     return results_for_plot
 
@@ -672,14 +662,29 @@ def main():
     # Detect mode
     degradation_model = config.get("degradation_model", "ja")
     regression = config.get("regression", False)
-    triple_param = (degradation_model == "ja_wf")
-    multi_param = (config.get("wf_target_param") == "both")
+    multi_param_classif = (config.get("wf_target_param") == "both")
 
-    if triple_param:
-        mode = "regression triple-param (ja + depth + rate)"
+    # Build param_specs for N-param models
+    param_specs = config.get("param_specs")
+    if param_specs is None and degradation_model in MULTI_PARAM_MODELS:
+        model_info = MULTI_PARAM_MODELS[degradation_model]
+        param_specs = []
+        for name in model_info["params"]:
+            if name == "ja":
+                param_specs.append({"name": "ja", "min": config["min_param"], "max": config["max_param"]})
+            elif name == "depth":
+                param_specs.append({"name": "depth", "min": config.get("min_depth", 0.1), "max": config.get("max_depth", 0.8)})
+            elif name == "rate":
+                param_specs.append({"name": "rate", "min": config.get("min_rate", 0.1), "max": config.get("max_rate", 0.8)})
+            elif name == "snr":
+                param_specs.append({"name": "snr", "min": config["min_param"], "max": config["max_param"]})
+
+    if param_specs is not None:
+        names = ", ".join(s["name"] for s in param_specs)
+        mode = f"regression N-param ({names})"
     elif regression:
-        mode = "regression multi-param" if multi_param else "regression"
-    elif multi_param:
+        mode = "regression"
+    elif multi_param_classif:
         mode = "classification multi-param"
     else:
         mode = "classification"
@@ -690,12 +695,17 @@ def main():
     encoder, controller, epoch = load_model(config, checkpoint_path, args.device)
     print(f"Model loaded (epoch {epoch})")
 
-    # Signal loss setup (regression modes only)
+    # Signal loss setup (regression modes only, not for noise models)
     forward_model = None
     signal_loss_fn = None
+    needs_noise = (
+        degradation_model == "tape_noise"
+        or MULTI_PARAM_MODELS.get(degradation_model, {}).get("needs_noise", False)
+    )
     compute_signal_loss = (
         (args.signal_loss or config.get("signal_loss_weight", 0.0) > 0.0)
-        and (regression or triple_param)
+        and (regression or param_specs is not None)
+        and not needs_noise
     )
     if compute_signal_loss:
         forward_model = DifferentiableForwardModel(
@@ -715,9 +725,9 @@ def main():
         )
         print("Signal loss (MR-STFT): enabled")
 
-    # Load noise bank for tape_noise model
+    # Load noise bank for tape_noise or combined models with noise
     noise_bank = None
-    if degradation_model == "tape_noise":
+    if needs_noise:
         noise_dir = args.noise_dir or config.get("noise_dir")
         noise_ext = args.noise_ext or config.get("noise_ext", "wav")
         if noise_dir is None:
@@ -765,18 +775,18 @@ def main():
         plot_path = str(plot_path)
 
     # Run evaluation
-    if triple_param:
-        plot_data = evaluate_triple_param(encoder, controller, test_files, config, args.device,
-                                          plot_path=plot_path, epoch=epoch,
-                                          forward_model=forward_model,
-                                          signal_loss_fn=signal_loss_fn)
+    if param_specs is not None:
+        plot_data = evaluate_n_param(encoder, controller, test_files, config, args.device,
+                                     param_specs=param_specs,
+                                     plot_path=plot_path, epoch=epoch,
+                                     noise_bank=noise_bank)
     elif regression:
         plot_data = evaluate_regression(encoder, controller, test_files, config, args.device,
                                         plot_path=plot_path, epoch=epoch,
                                         forward_model=forward_model,
                                         signal_loss_fn=signal_loss_fn,
                                         noise_bank=noise_bank)
-    elif multi_param:
+    elif multi_param_classif:
         plot_data = evaluate_multi_param(encoder, controller, test_files, config, args.device)
     else:
         plot_data = evaluate_classification(encoder, controller, test_files, config, args.device)

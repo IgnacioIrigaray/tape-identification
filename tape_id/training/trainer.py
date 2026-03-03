@@ -15,9 +15,9 @@ import logging
 
 
 class TapeIdentificationTrainer:
-    """Trainer supporting classification and regression, single/multi/triple-param.
+    """Trainer supporting classification and regression, single-param and N-param.
 
-    Detects mode automatically from controller attributes (triple_param, multi_param, regression).
+    Detects mode automatically from controller attributes and param_specs.
 
     Args:
         patience: Early stopping patience (epochs without improvement).
@@ -45,10 +45,7 @@ class TapeIdentificationTrainer:
         signal_loss_fn: nn.Module = None,
         min_param: float = 0.0,
         max_param: float = 1.0,
-        min_depth: float = 0.0,
-        max_depth: float = 1.0,
-        min_rate: float = 0.0,
-        max_rate: float = 1.0,
+        param_specs: list = None,
     ):
         self.encoder = encoder.to(device)
         self.controller = controller.to(device)
@@ -62,7 +59,7 @@ class TapeIdentificationTrainer:
         self.grad_clip_norm = grad_clip_norm
 
         # Detect mode from controller
-        self.triple_param = getattr(controller, 'triple_param', False)
+        self.param_specs = param_specs
         self.multi_param = getattr(controller, 'multi_param', False)
         self.regression = getattr(controller, 'regression', False)
 
@@ -70,12 +67,13 @@ class TapeIdentificationTrainer:
         self.min_param = min_param
         self.max_param = max_param
         self.param_range = max_param - min_param
-        self.min_depth = min_depth
-        self.max_depth = max_depth
-        self.depth_range = max_depth - min_depth
-        self.min_rate = min_rate
-        self.max_rate = max_rate
-        self.rate_range = max_rate - min_rate
+
+        # N-param ranges
+        if param_specs is not None:
+            self.param_ranges = {
+                s["name"]: (s["min"], s["max"], s["max"] - s["min"])
+                for s in param_specs
+            }
 
         # Loss function
         self.loss_fn = nn.MSELoss() if self.regression else nn.CrossEntropyLoss()
@@ -138,90 +136,38 @@ class TapeIdentificationTrainer:
 
         signal_loss = torch.tensor(0.0, device=self.device)
 
-        if self.triple_param:
-            y, target_ja, target_d, target_r = batch
-            y = y.to(self.device)
-            target_ja = target_ja.to(self.device).unsqueeze(1)
-            target_d = target_d.to(self.device).unsqueeze(1)
-            target_r = target_r.to(self.device).unsqueeze(1)
+        if self.param_specs is not None:
+            # N-param regression: batch = (y, target_0, target_1, ..., target_N)
+            y = batch[0].to(self.device)
+            targets = {
+                s["name"]: batch[i + 1].to(self.device).unsqueeze(1)
+                for i, s in enumerate(self.param_specs)
+            }
 
             pred = self.controller(self.encoder(y))
-            pred_ja_norm = torch.sigmoid(pred["ja"])
-            pred_d_norm = torch.sigmoid(pred["depth"])
-            pred_r_norm = torch.sigmoid(pred["rate"])
 
-            # Scale to physical units
-            pred_ja_sc = pred_ja_norm * self.param_range + self.min_param
-            pred_d_sc = pred_d_norm * self.depth_range + self.min_depth
-            pred_r_sc = pred_r_norm * self.rate_range + self.min_rate
-            target_ja_sc = target_ja * self.param_range + self.min_param
-            target_d_sc = target_d * self.depth_range + self.min_depth
-            target_r_sc = target_r * self.rate_range + self.min_rate
+            param_loss = torch.tensor(0.0, device=self.device)
+            metrics = {}
+            pred_norms = {}
 
-            param_loss = (self.loss_fn(pred_ja_sc, target_ja_sc)
-                    + self.loss_fn(pred_d_sc, target_d_sc)
-                    + self.loss_fn(pred_r_sc, target_r_sc))
+            for name, (lo, hi, rng) in self.param_ranges.items():
+                pred_norm = torch.sigmoid(pred[name])
+                pred_norms[name] = pred_norm
+                pred_sc = pred_norm * rng + lo
+                target_sc = targets[name] * rng + lo
+                param_loss = param_loss + self.loss_fn(pred_sc, target_sc)
+
+                n = target_sc.size(0)
+                diff = pred_sc - target_sc
+                metrics[f"ae_{name}"] = (diff.abs().sum().item(), n)
+                metrics[f"se_{name}"] = ((diff ** 2).sum().item(), n)
 
             if self.use_signal_loss and x_clean is not None:
-                pred_norm = {
-                    "ja":    pred_ja_norm,
-                    "depth": pred_d_norm,
-                    "rate":  pred_r_norm,
-                }
-                y_rec = self.forward_model(x_clean, pred_norm)
+                y_rec = self.forward_model(x_clean, pred_norms)
                 signal_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
 
             total_loss = self.param_loss_weight * param_loss + self.signal_loss_weight * signal_loss
-
-            n = target_ja.size(0)
-            diff_ja = pred_ja_sc - target_ja_sc
-            diff_d = pred_d_sc - target_d_sc
-            diff_r = pred_r_sc - target_r_sc
-            return total_loss, param_loss, signal_loss, {
-                "ae_ja": (diff_ja.abs().sum().item(), n),
-                "ae_depth": (diff_d.abs().sum().item(), n),
-                "ae_rate": (diff_r.abs().sum().item(), n),
-                "se_ja": ((diff_ja ** 2).sum().item(), n),
-                "se_depth": ((diff_d ** 2).sum().item(), n),
-                "se_rate": ((diff_r ** 2).sum().item(), n),
-            }
-
-        elif self.regression and self.multi_param:
-            y, target_d, target_r = batch
-            y = y.to(self.device)
-            target_d = target_d.to(self.device).unsqueeze(1)
-            target_r = target_r.to(self.device).unsqueeze(1)
-
-            pred = self.controller(self.encoder(y))
-            pred_d_norm = torch.sigmoid(pred["depth"])
-            pred_r_norm = torch.sigmoid(pred["rate"])
-
-            pred_d_sc = pred_d_norm * self.depth_range + self.min_depth
-            pred_r_sc = pred_r_norm * self.rate_range + self.min_rate
-            target_d_sc = target_d * self.depth_range + self.min_depth
-            target_r_sc = target_r * self.rate_range + self.min_rate
-
-            param_loss = self.loss_fn(pred_d_sc, target_d_sc) + self.loss_fn(pred_r_sc, target_r_sc)
-
-            if self.use_signal_loss and x_clean is not None:
-                pred_norm = {
-                    "depth": pred_d_norm,
-                    "rate":  pred_r_norm,
-                }
-                y_rec = self.forward_model(x_clean, pred_norm)
-                signal_loss = self.signal_loss_fn(y_rec.squeeze(1), y.squeeze(1))
-
-            total_loss = self.param_loss_weight * param_loss + self.signal_loss_weight * signal_loss
-
-            n = target_d.size(0)
-            diff_d = pred_d_sc - target_d_sc
-            diff_r = pred_r_sc - target_r_sc
-            return total_loss, param_loss, signal_loss, {
-                "ae_depth": (diff_d.abs().sum().item(), n),
-                "ae_rate": (diff_r.abs().sum().item(), n),
-                "se_depth": ((diff_d ** 2).sum().item(), n),
-                "se_rate": ((diff_r ** 2).sum().item(), n),
-            }
+            return total_loss, param_loss, signal_loss, metrics
 
         elif self.regression:
             y, target = batch
@@ -465,10 +411,11 @@ class TapeIdentificationTrainer:
 
     def train(self, num_epochs: int, resume_from: Optional[str] = None):
         """Run full training loop."""
-        if self.triple_param:
-            mode = "regression triple-param (ja + depth + rate)"
+        if self.param_specs is not None:
+            names = ", ".join(s["name"] for s in self.param_specs)
+            mode = f"regression N-param ({names})"
         elif self.regression:
-            mode = "regression multi-param" if self.multi_param else "regression"
+            mode = "regression"
         elif self.multi_param:
             mode = "classification multi-param"
         else:

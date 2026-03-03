@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from tape_id.models.encoder import SpectralEncoder
 from tape_id.models.controller import ParameterController
-from tape_id.data.dataset import TapeSaturationDataset
+from tape_id.data.dataset import TapeSaturationDataset, MULTI_PARAM_MODELS
 from tape_id.training.trainer import TapeIdentificationTrainer
 from tape_id.utils import model_summary, seed_worker
 
@@ -61,11 +61,7 @@ def parse_args():
     parser.add_argument("--patience", type=int, default=None)
     parser.add_argument("--grad_clip_norm", type=float, default=None)
 
-    # Triple/multi-param overrides
-    parser.add_argument("--min_depth", type=float, default=None)
-    parser.add_argument("--max_depth", type=float, default=None)
-    parser.add_argument("--min_rate", type=float, default=None)
-    parser.add_argument("--max_rate", type=float, default=None)
+    # Loss weight overrides
     parser.add_argument("--signal_loss_weight", type=float, default=None)
     parser.add_argument("--param_loss_weight", type=float, default=None)
 
@@ -84,19 +80,46 @@ def setup_experiment_dirs(name: str) -> tuple:
     return str(output_dir), str(log_dir)
 
 
-def create_controller(config: dict) -> ParameterController:
+def build_param_specs(config: dict):
+    """Build param_specs list from config.
+
+    Returns None for single-param modes, list of dicts for N-param modes.
+    """
+    # Explicit param_specs in YAML takes priority
+    if "param_specs" in config:
+        return config["param_specs"]
+
+    degradation_model = config.get("degradation_model", "ja")
+    if degradation_model not in MULTI_PARAM_MODELS:
+        return None
+
+    # Build from legacy fields for backward compat (ja_wf)
+    model_info = MULTI_PARAM_MODELS[degradation_model]
+    specs = []
+    for name in model_info["params"]:
+        if name == "ja":
+            specs.append({"name": "ja", "min": config["min_param"], "max": config["max_param"]})
+        elif name == "depth":
+            specs.append({"name": "depth", "min": config.get("min_depth", 0.1), "max": config.get("max_depth", 0.8)})
+        elif name == "rate":
+            specs.append({"name": "rate", "min": config.get("min_rate", 0.1), "max": config.get("max_rate", 0.8)})
+        elif name == "snr":
+            specs.append({"name": "snr", "min": config["min_param"], "max": config["max_param"]})
+    return specs
+
+
+def create_controller(config: dict, param_specs=None) -> ParameterController:
     """Create the appropriate ParameterController based on config."""
     regression = config.get("regression", False)
-    degradation_model = config.get("degradation_model", "ja")
-    triple_param = (degradation_model == "ja_wf")
     wf_target_param = config.get("wf_target_param", "depth")
 
-    if triple_param:
+    if param_specs is not None:
+        param_names = [s["name"] for s in param_specs]
         return ParameterController(
             embed_dim=config["embed_dim"],
             hidden_dim=config["hidden_dim"],
             regression=True,
-            triple_param=True,
+            param_names=param_names,
         )
     elif wf_target_param == "both":
         return ParameterController(
@@ -142,6 +165,11 @@ def main():
     for k, v in config.items():
         print(f"  {k}: {v}")
 
+    # Build param_specs for N-param models
+    param_specs = build_param_specs(config)
+    if param_specs is not None:
+        print(f"\nN-param mode: {[s['name'] for s in param_specs]}")
+
     # Determine signal loss settings before dataset creation (return_clean affects batch format)
     signal_loss_weight = config.get("signal_loss_weight", 0.0)
     param_loss_weight = config.get("param_loss_weight", 1.0)
@@ -186,6 +214,7 @@ def main():
         noise_preload=config.get("noise_preload", False),
         min_data=config.get("min_data"),
         max_data=config.get("max_data"),
+        param_specs=param_specs,
     )
 
     train_dataset = TapeSaturationDataset(
@@ -237,19 +266,28 @@ def main():
         width_mult=2,
         multi_resolution=config.get("multi_resolution", False),
     )
-    controller = create_controller(config)
+    controller = create_controller(config, param_specs=param_specs)
     model_summary(encoder, controller)
 
     # Signal loss: instantiate forward model and loss function
     forward_model = None
     signal_loss_fn = None
 
+    # Don't use signal loss for models with noise (not differentiable)
+    degradation_model = config.get("degradation_model", "ja")
+    needs_noise = MULTI_PARAM_MODELS.get(degradation_model, {}).get("needs_noise", False)
+    if degradation_model == "tape_noise":
+        needs_noise = True
+    if needs_noise:
+        use_signal_loss = False
+        signal_loss_weight = 0.0
+
     if use_signal_loss:
         from tape_id.models.tape_processor import DifferentiableForwardModel
         from tape_id.training.losses import MultiResolutionSTFTLoss
 
         forward_model = DifferentiableForwardModel(
-            degradation_model=config["degradation_model"],
+            degradation_model=degradation_model,
             min_param=config["min_param"],
             max_param=config["max_param"],
             min_depth=config.get("min_depth", 0.1),
@@ -301,10 +339,7 @@ def main():
         signal_loss_fn=signal_loss_fn,
         min_param=config["min_param"],
         max_param=config["max_param"],
-        min_depth=config.get("min_depth", 0.0),
-        max_depth=config.get("max_depth", 1.0),
-        min_rate=config.get("min_rate", 0.0),
-        max_rate=config.get("max_rate", 1.0),
+        param_specs=param_specs,
     )
 
     # Auto-resume from last checkpoint

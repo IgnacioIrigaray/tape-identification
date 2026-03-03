@@ -4,13 +4,13 @@
 audio_dir: /mnt/data/working_datasets/jamendo
 ext: mp3
 
-batch_size: 48
+batch_size: 24
 num_workers: 1
 sample_rate: 22050
 audio_length: 65536
 train_examples_per_epoch: 5000
 val_examples_per_epoch: 500
-buffer_size_gb: 5
+buffer_size_gb: 3
 buffer_reload_rate: 5000
 
 # Model

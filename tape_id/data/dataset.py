@@ -10,7 +10,9 @@ Degradation models:
     hard_clipping Hard clipping
     ja            Jiles-Atherton hysteresis (RK4, numba)
     wow_flutter   Wow + flutter (variable delay)
-    ja_wf         JA + wow/flutter (triple-param)
+    ja_wf         JA + wow/flutter (multi-param)
+    ja_noise      JA + tape noise (multi-param)
+    ja_wf_noise   JA + wow/flutter + tape noise (multi-param)
     tape_noise    Additive tape noise from MagTapeDB at a given SNR [dB]
 """
 
@@ -31,6 +33,28 @@ from .audio import AudioFile
 from .. import utils
 
 EPSILON = 1e-8
+
+# ---------------------------------------------------------------------------
+# Multi-param combined degradation models
+# ---------------------------------------------------------------------------
+
+MULTI_PARAM_MODELS = {
+    "ja_wf": {
+        "params": ["ja", "depth", "rate"],
+        "chain": ["ja", "wow_flutter"],
+        "needs_noise": False,
+    },
+    "ja_noise": {
+        "params": ["ja", "snr"],
+        "chain": ["ja", "tape_noise"],
+        "needs_noise": True,
+    },
+    "ja_wf_noise": {
+        "params": ["ja", "depth", "rate", "snr"],
+        "chain": ["ja", "wow_flutter", "tape_noise"],
+        "needs_noise": True,
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Degradation functions
@@ -393,7 +417,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
     """Dataset that applies audio degradation on-the-fly for parameter identification.
 
     Supports multiple degradation models (tanh, hard_clipping, ja, wow_flutter, ja_wf,
-    tape_noise) and both classification and regression modes.
+    ja_noise, ja_wf_noise, tape_noise) and both classification and regression modes.
 
     Args:
         audio_dir: Directory with audio files.
@@ -404,7 +428,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         max_param: Maximum parameter value.
         num_classes: Number of discrete classes (classification mode).
         degradation_model: One of "tanh", "hard_clipping", "ja", "wow_flutter", "ja_wf",
-            "tape_noise".
+            "ja_noise", "ja_wf_noise", "tape_noise".
         regression: If True, continuous parameter prediction in [0, 1].
         buffer_size_gb: GB of audio to keep in RAM.
         buffer_reload_rate: Examples between buffer reloads.
@@ -461,6 +485,8 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         noise_preload: bool = False,
         min_data: Optional[float] = None,
         max_data: Optional[float] = None,
+        # Multi-param specs (overrides individual min/max params)
+        param_specs: Optional[list] = None,
     ):
         super().__init__()
         self.return_clean = return_clean
@@ -498,8 +524,10 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
             self.param_values = list(np.linspace(min_param, max_param, num_classes))
 
         # Mode-specific setup
-        if degradation_model == "ja_wf":
-            self._setup_triple_param(min_param, max_param, min_depth, max_depth, min_rate, max_rate)
+        self.param_specs = None
+        if degradation_model in MULTI_PARAM_MODELS:
+            self._setup_multi_param(param_specs, degradation_model,
+                                    min_param, max_param, min_depth, max_depth, min_rate, max_rate)
         elif wf_target_param == "both":
             self._setup_dual_param(min_param, max_param, num_classes, num_classes_depth,
                                    num_classes_rate, min_depth, max_depth, min_rate, max_rate,
@@ -545,9 +573,11 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         self.noise_files_loaded = {}
         self.noise_items_since_load = noise_buffer_reload_rate  # trigger load on first access
 
-        if degradation_model == "tape_noise":
+        needs_noise = (degradation_model == "tape_noise"
+                       or MULTI_PARAM_MODELS.get(degradation_model, {}).get("needs_noise", False))
+        if needs_noise:
             if noise_dir is None:
-                raise ValueError("tape_noise model requires noise_dir (path to MagTapeDB)")
+                raise ValueError(f"{degradation_model} model requires noise_dir (path to MagTapeDB)")
             noise_filepaths = self._discover_files(noise_dir, noise_input_dirs, noise_ext)
             rng_noise = random.Random(42)
             rng_noise.shuffle(noise_filepaths)
@@ -579,18 +609,30 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
             if len(self.noise_files) < 1:
                 raise RuntimeError(f"No noise files found in {noise_dir}")
 
-    def _setup_triple_param(self, min_param, max_param, min_depth, max_depth, min_rate, max_rate):
-        """Configure triple-param mode: JA drive + WF depth + WF rate."""
-        self.min_ja = min_param
-        self.max_ja = max_param
-        self.min_depth = min_depth or 0.1
-        self.max_depth = max_depth or 0.8
-        self.min_rate = min_rate or 0.1
-        self.max_rate = max_rate or 0.8
-        print(f"JA + Wow/Flutter TRIPLE param REGRESSION mode:")
-        print(f"  JA drive range: [{self.min_ja:.3f}, {self.max_ja:.3f}]")
-        print(f"  WF depth range: [{self.min_depth:.3f}, {self.max_depth:.3f}]")
-        print(f"  WF rate range:  [{self.min_rate:.3f}, {self.max_rate:.3f}]")
+    def _setup_multi_param(self, param_specs, degradation_model,
+                           min_param, max_param, min_depth, max_depth, min_rate, max_rate):
+        """Configure multi-param mode from param_specs or legacy fields."""
+        if param_specs is not None:
+            self.param_specs = param_specs
+        else:
+            # Backward compat: build param_specs from individual fields
+            defaults = {
+                "ja": (min_param or 1.0, max_param or 10.0),
+                "depth": (min_depth or 0.1, max_depth or 0.8),
+                "rate": (min_rate or 0.1, max_rate or 0.8),
+                "snr": (min_param or 0.0, max_param or 50.0),
+            }
+            expected = MULTI_PARAM_MODELS[degradation_model]["params"]
+            self.param_specs = [
+                {"name": p, "min": defaults[p][0], "max": defaults[p][1]}
+                for p in expected
+            ]
+
+        model_info = MULTI_PARAM_MODELS[degradation_model]
+        print(f"Multi-param REGRESSION mode ({degradation_model}):")
+        print(f"  Chain: {' → '.join(model_info['chain'])}")
+        for s in self.param_specs:
+            print(f"  {s['name']}: [{s['min']:.3f}, {s['max']:.3f}]")
 
     def _setup_dual_param(self, min_param, max_param, num_classes,
                           num_classes_depth, num_classes_rate,
@@ -760,33 +802,46 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         x = self._get_random_audio()
 
-        if self.degradation_model == "ja_wf":
-            return self._apply_triple_param(x)
+        if self.degradation_model in MULTI_PARAM_MODELS:
+            return self._apply_multi_param(x)
 
         if self.degradation_model == "wow_flutter" and self.wf_target_param == "both":
             return self._apply_dual_param(x)
 
         return self._apply_single_param(x)
 
-    def _apply_triple_param(self, x: torch.Tensor):
-        """Apply JA + WF degradation, return (y, ja_target, depth_target, rate_target)."""
-        ja_val = random.uniform(self.min_ja, self.max_ja)
-        depth_val = random.uniform(self.min_depth, self.max_depth)
-        rate_val = random.uniform(self.min_rate, self.max_rate)
+    def _apply_multi_param(self, x: torch.Tensor):
+        """Apply chained degradation, return (y, *targets) with N normalized targets."""
+        model_info = MULTI_PARAM_MODELS[self.degradation_model]
 
-        y = ja_hysteresis(x, ja_val, sample_rate=self.sample_rate)
-        y = wow_flutter(y, depth_val, sample_rate=self.sample_rate,
-                        wow_rate=rate_val, flutter_rate=self.flutter_rate,
-                        enable_ou=self.enable_ou, interpolation=self.wf_interpolation)
+        # Sample all parameters
+        vals = {}
+        for spec in self.param_specs:
+            vals[spec["name"]] = random.uniform(spec["min"], spec["max"])
+
+        # Apply degradation chain
+        y = x
+        for step in model_info["chain"]:
+            if step == "ja":
+                y = ja_hysteresis(y, vals["ja"], sample_rate=self.sample_rate)
+            elif step == "wow_flutter":
+                y = wow_flutter(y, vals["depth"], sample_rate=self.sample_rate,
+                                wow_rate=vals["rate"], flutter_rate=self.flutter_rate,
+                                enable_ou=self.enable_ou, interpolation=self.wf_interpolation)
+            elif step == "tape_noise":
+                noise = self._get_random_noise(y.shape[-1])
+                y = tape_noise(y, vals["snr"], noise)
+
         y = utils.conform_length(y, self.length)
         y = utils.linear_fade(y, sample_rate=self.sample_rate)
 
-        ja_target = (ja_val - self.min_ja) / (self.max_ja - self.min_ja)
-        depth_target = (depth_val - self.min_depth) / (self.max_depth - self.min_depth)
-        rate_target = (rate_val - self.min_rate) / (self.max_rate - self.min_rate)
-        targets = (torch.tensor(ja_target, dtype=torch.float32),
-                   torch.tensor(depth_target, dtype=torch.float32),
-                   torch.tensor(rate_target, dtype=torch.float32))
+        # Normalize targets to [0, 1]
+        targets = tuple(
+            torch.tensor((vals[s["name"]] - s["min"]) / (s["max"] - s["min"]),
+                         dtype=torch.float32)
+            for s in self.param_specs
+        )
+
         if self.return_clean:
             x_clean = utils.linear_fade(utils.conform_length(x.clone(), self.length),
                                         sample_rate=self.sample_rate)
