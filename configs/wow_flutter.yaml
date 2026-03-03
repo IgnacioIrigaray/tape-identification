@@ -26,6 +26,12 @@ regression: true
 min_param: 0.1
 max_param: 0.8
 
+# Headroom: data is sampled from [min_data, max_data] but targets are
+# normalized with [min_param, max_param], so predictions never need to
+# reach exactly 0 or 1.  Omit or set equal to min/max_param to disable.
+min_data: -0.4
+max_data: 1.3
+
 # Wow/flutter settings
 flutter_rate: 0.5
 enable_ou: true

@@ -23,6 +23,12 @@ regression: true
 min_param: 1.0
 max_param: 10.0
 
+# Headroom: data is sampled from [min_data, max_data] but targets are
+# normalized with [min_param, max_param], so predictions never need to
+# reach exactly 0 or 1.  Omit or set equal to min/max_param to disable.
+min_data: -3.0
+max_data: 14.0
+
 # Training
 num_epochs: 400
 learning_rate: 1.0e-3
