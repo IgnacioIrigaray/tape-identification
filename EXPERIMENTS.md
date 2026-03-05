@@ -44,21 +44,21 @@ Se entrena con cada dataset para evaluar el impacto del dominio de audio.
 
 | ID | Degradacion | Parametro | Rango | Config | Exp name | MAE | RMSE | R2 |
 |---|---|---|---|---|---|---|---|---|
-| 1a | JA hysteresis | drive | [1, 10] | `configs/ja.yaml` | `exp_ja_jamendo` | | | |
-| 1b | Tanh saturation | gain | [1, 10] | `configs/tanh.yaml` | `exp_tanh_jamendo` | | | |
-| 1c | Hard clipping | gain | [1, 4] | `configs/hard_clipping.yaml` | `exp_hc_jamendo` | | | |
-| 1d | Wow/Flutter | depth | [0.1, 0.8] | `configs/wow_flutter.yaml` | `exp_wf_jamendo` | | | |
-| 1e | Tape noise | SNR (dB) | [10, 30] | `configs/tape_noise.yaml` | `exp_noise_jamendo` | | | |
+| 1a | JA hysteresis | drive | [1, 10] | `configs/ja.yaml` | `exp_ja_jamendo` | 2.16 | X | 0.69 |
+| 1b | Tanh saturation | gain | [1, 10] | `configs/tanh.yaml` | `exp_tanh_jamendo` | 2.18 | X | 0.65 |
+| 1c | Hard clipping | gain | [1, 4] | `configs/hard_clipping.yaml` | `exp_hc_jamendo` | 1.0 | X | 0.6 |
+| 1d | Wow/Flutter | depth | [0.1, 0.8] | `configs/wow_flutter.yaml` | `exp_wf_jamendo` | 0.22 | X | 0.64 |
+| 1e | Tape noise | SNR (dB) | [10, 30] | `configs/tape_noise.yaml` | `exp_noise_jamendo` | 2.1 | X | 0.74 |
 
 ### GuitarSet
 
 | ID | Degradacion | Parametro | Rango | Config | Exp name | MAE | RMSE | R2 |
 |---|---|---|---|---|---|---|---|---|
-| 2a | JA hysteresis | drive | [1, 10] | `configs/ja.yaml` | `exp_ja_guitarset` | | | |
-| 2b | Tanh saturation | gain | [1, 10] | `configs/tanh.yaml` | `exp_tanh_guitarset` | | | |
-| 2c | Hard clipping | gain | [1, 4] | `configs/hard_clipping.yaml` | `exp_hc_guitarset` | | | |
-| 2d | Wow/Flutter | depth | [0.1, 0.8] | `configs/wow_flutter.yaml` | `exp_wf_guitarset` | | | |
-| 2e | Tape noise | SNR (dB) | [10, 30] | `configs/tape_noise.yaml` | `exp_noise_guitarset` | | | |
+| 2a | JA hysteresis | drive | [1, 10] | `configs/ja.yaml` | `exp_ja_guitarset` | 1.6 | X | 0.8 |
+| 2b | Tanh saturation | gain | [1, 10] | `configs/tanh.yaml` | `exp_tanh_guitarset` | 2.0 | X | 0.77 |
+| 2c | Hard clipping | gain | [1, 4] | `configs/hard_clipping.yaml` | `exp_hc_guitarset` | 0.71 | X | 0.8 |
+| 2d | Wow/Flutter | depth | [0.1, 0.8] | `configs/wow_flutter.yaml` | `exp_wf_guitarset` | 0.14 | X | 0.8 |
+| 2e | Tape noise | SNR (dB) | [10, 30] | `configs/tape_noise.yaml` | `exp_noise_guitarset` | 0.87 | X | 0.95 |
 
 **Para entrenar con GuitarSet**: cambiar `audio_dir` y `ext` en el config:
 ```yaml
