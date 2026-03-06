@@ -36,9 +36,13 @@ param_specs:
   - name: ja
     min: 1.0
     max: 10.0
+    min_data: 0
+    max_data: 11
   - name: snr
     min: 10.0
     max: 30.0
+    min_data: 0.0
+    max_data: 40.0
 
 # Wow/flutter settings (not used but kept for compatibility)
 flutter_rate: 0.5

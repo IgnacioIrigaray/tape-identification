@@ -7,12 +7,6 @@ ext: mp3
 # audio_dir: /mnt/data/working_datasets/guitarset
 # ext: wav
 
-# Noise source (MagTapeDB)
-noise_dir: /mnt/data/working_datasets/MagTapeDB/tape_noise
-noise_ext: wav
-noise_train_frac: 0.8
-noise_preload: true
-
 batch_size: 32
 num_workers: 1
 sample_rate: 22050
@@ -26,7 +20,7 @@ buffer_reload_rate: 5000
 encoder_model: efficient_net
 embed_dim: 1024
 hidden_dim: 256
-degradation_model: ja_wf_noise
+degradation_model: ja_wf
 regression: true
 min_param: 1.0
 max_param: 10.0
