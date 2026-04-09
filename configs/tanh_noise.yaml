@@ -1,0 +1,70 @@
+# JA hysteresis + Tape noise (2-param: drive + SNR)
+# Usage: python scripts/train.py --config configs/ja_noise.yaml --name exp_ja_noise_jamendo
+
+# Clean audio source
+audio_dir: /mnt/data/working_datasets/jamendo
+ext: mp3
+# audio_dir: /mnt/data/working_datasets/guitarset
+# ext: wav
+
+# Noise source (MagTapeDB)
+noise_dir: /mnt/data/working_datasets/MagTapeDB/tape_noise
+noise_ext: wav
+noise_train_frac: 0.8
+noise_preload: true
+
+batch_size: 32
+num_workers: 1
+sample_rate: 22050
+audio_length: 65536
+train_examples_per_epoch: 5000
+val_examples_per_epoch: 500
+buffer_size_gb: 5
+buffer_reload_rate: 5000
+
+# Model
+encoder_model: efficient_net
+embed_dim: 1024
+hidden_dim: 256
+degradation_model: tanh_noise
+regression: true
+min_param: 1.0
+max_param: 10.0
+
+# N-param specs
+param_specs:
+  - name: tanh
+    min: 1.0
+    max: 10.0
+    min_data: 0
+    max_data: 11
+  - name: snr
+    min: 30.0
+    max: 30.0000000001
+    min_data: 30.0
+    max_data: 30.0000000001
+
+# Wow/flutter settings (not used but kept for compatibility)
+flutter_rate: 0.5
+enable_ou: true
+wf_interpolation: linear
+
+# Training
+num_epochs: 400
+learning_rate: 1.0e-5
+weight_decay: 1.0e-5
+device: cuda
+patience: 100
+min_delta: 0.001
+grad_clip_norm: 1.0
+
+# LR scheduler
+scheduler_factor: 0.5
+scheduler_patience: 5
+
+# Signal loss — disabled (tape_noise is not differentiable)
+signal_loss_weight: 0.0
+param_loss_weight: 1.0
+signal_loss_fft_sizes: [1024, 2048, 8192]
+signal_loss_hop_sizes: [256, 512, 2048]
+signal_loss_win_lengths: [1024, 2048, 8192]

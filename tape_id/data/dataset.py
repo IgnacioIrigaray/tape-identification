@@ -7,6 +7,7 @@ Generates pairs (y, target) where:
 
 Degradation models:
     tanh          Tanh saturation
+    tanh_noise    Tanh + tape noise (multi-param)
     hard_clipping Hard clipping
     ja            Jiles-Atherton hysteresis (RK4, numba)
     wow_flutter   Wow + flutter (variable delay)
@@ -43,6 +44,11 @@ MULTI_PARAM_MODELS = {
         "params": ["ja", "depth", "rate"],
         "chain": ["ja", "wow_flutter"],
         "needs_noise": False,
+    },
+    "tanh_noise": {
+        "params": ["tanh", "snr"],
+        "chain": ["tanh", "tape_noise"],
+        "needs_noise": True,
     },
     "ja_noise": {
         "params": ["ja", "snr"],
@@ -427,7 +433,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         min_param: Minimum parameter value.
         max_param: Maximum parameter value.
         num_classes: Number of discrete classes (classification mode).
-        degradation_model: One of "tanh", "hard_clipping", "ja", "wow_flutter", "ja_wf",
+        degradation_model: One of "tanh", "tanh_noise", "hard_clipping", "ja", "wow_flutter", "ja_wf",
             "ja_noise", "ja_wf_noise", "tape_noise".
         regression: If True, continuous parameter prediction in [0, 1].
         buffer_size_gb: GB of audio to keep in RAM.
@@ -632,7 +638,12 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         print(f"Multi-param REGRESSION mode ({degradation_model}):")
         print(f"  Chain: {' → '.join(model_info['chain'])}")
         for s in self.param_specs:
-            print(f"  {s['name']}: [{s['min']:.3f}, {s['max']:.3f}]")
+            data_min = s.get("min_data", s["min"])
+            data_max = s.get("max_data", s["max"])
+            if data_min != s["min"] or data_max != s["max"]:
+                print(f"  {s['name']}: data [{data_min:.3f}, {data_max:.3f}], norm [{s['min']:.3f}, {s['max']:.3f}]")
+            else:
+                print(f"  {s['name']}: [{s['min']:.3f}, {s['max']:.3f}]")
 
     def _setup_dual_param(self, min_param, max_param, num_classes,
                           num_classes_depth, num_classes_rate,
@@ -817,7 +828,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         # Sample all parameters
         vals = {}
         for spec in self.param_specs:
-            vals[spec["name"]] = random.uniform(spec["min"], spec["max"])
+            vals[spec["name"]] = random.uniform(spec.get("min_data", spec["min"]), spec.get("max_data", spec["max"]))
 
         # Apply degradation chain
         y = x
