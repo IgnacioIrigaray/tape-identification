@@ -213,6 +213,8 @@ class DifferentiableForwardModel(nn.Module):
         """
         if self.degradation_model == "ja_wf":
             return self._apply_ja_wf(x_clean, pred)
+        elif self.degradation_model == "wf_ja":
+            return self._apply_wf_ja(x_clean, pred)
         elif self.degradation_model == "ja":
             return self._apply_ja(x_clean, pred)
         elif self.degradation_model == "hard_clipping":
@@ -246,6 +248,14 @@ class DifferentiableForwardModel(nn.Module):
         # Sinusoidal wow/flutter with torch.lerp
         y = self._apply_wow_flutter_batch(y, pred["depth"], pred["rate"])
         return y
+
+    def _apply_wf_ja(self, x, pred):
+        # Sinusoidal wow/flutter first, then JA saturation
+        y = self._apply_wow_flutter_batch(x, pred["depth"], pred["rate"])
+        gain = self.min_param + pred["ja"] * (self.max_param - self.min_param)  # [B, 1]
+        gain = gain.unsqueeze(-1)                                                # [B, 1, 1]
+        a = 1.0 / gain
+        return 3.0 * a * langevin(y / a)
 
     def _apply_wow_flutter_batch(self, y, depth_norm, rate_norm):
         """Apply sinusoidal wow/flutter per item in batch (differentiable w.r.t. depth, rate)."""

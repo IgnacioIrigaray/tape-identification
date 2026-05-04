@@ -1,0 +1,66 @@
+# Wow/Flutter → JA: degrade with wow-flutter then JA saturation.
+# Estimates wow-flutter parameters (depth, rate) while JA drive is a nuisance.
+
+audio_dir: /home/emartinez/data/public/mtg-jamendo-dataset/audios
+ext: mp3
+
+batch_size: 32
+num_workers: 1
+sample_rate: 22050
+audio_length: 65536
+train_examples_per_epoch: 5000
+val_examples_per_epoch: 500
+buffer_size_gb: 3
+buffer_reload_rate: 5000
+
+# Model
+encoder_model: efficient_net
+embed_dim: 1024
+hidden_dim: 256
+degradation_model: wf_ja
+regression: true
+
+# Target parameters (to be estimated)
+param_specs:
+  - name: depth
+    min: 0.1
+    max: 0.8
+    min_data: 0.0
+    max_data: 0.9
+  - name: rate
+    min: 0.1
+    max: 0.8
+    min_data: 0.0
+    max_data: 0.9
+
+# Nuisance parameters: sampled for degradation but not estimated
+nuisance_specs:
+  - name: ja
+    min: 1.0
+    max: 10.0
+
+# Wow/flutter settings
+flutter_rate: 0.5
+enable_ou: true
+wf_interpolation: linear
+
+# Training
+num_epochs: 400
+learning_rate: 1.0e-3
+weight_decay: 1.0e-5
+device: cuda
+patience: 100
+min_delta: 0.001
+grad_clip_norm: 1.0
+
+# LR scheduler
+scheduler_factor: 0.5
+scheduler_patience: 5
+seed: 42
+
+# Signal loss
+signal_loss_weight: 0.0
+param_loss_weight: 1.0
+signal_loss_fft_sizes: [1024, 2048, 8192]
+signal_loss_hop_sizes: [256, 512, 2048]
+signal_loss_win_lengths: [1024, 2048, 8192]

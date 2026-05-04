@@ -342,7 +342,8 @@ def save_scatter_plots(results, epoch, output_path):
 # ---------------------------------------------------------------------------
 
 def evaluate_n_param(encoder, controller, test_files, config, device,
-                     param_specs, plot_path=None, epoch=None, plot_every=25,
+                     param_specs, nuisance_specs, 
+                     plot_path=None, epoch=None, plot_every=25,
                      noise_bank=None):
     """Evaluate N-param regression: generic loop over param_specs and chain steps."""
     sample_rate = config["sample_rate"]
@@ -361,8 +362,8 @@ def evaluate_n_param(encoder, controller, test_files, config, device,
         for fpath in pbar:
             audio = _load_and_prepare_audio(fpath, sample_rate, audio_length)
 
-            # Sample random param values
-            vals = {s["name"]: random.uniform(s["min"], s["max"]) for s in param_specs}
+            # Sample random param values (both target and nuisance)
+            vals = {s["name"]: random.uniform(s["min"], s["max"]) for s in param_specs+nuisance_specs}
 
             # Apply degradation chain
             x = audio.unsqueeze(0)
@@ -678,6 +679,21 @@ def main():
                 param_specs.append({"name": "rate", "min": config.get("min_rate", 0.1), "max": config.get("max_rate", 0.8)})
             elif name == "snr":
                 param_specs.append({"name": "snr", "min": config["min_param"], "max": config["max_param"]})
+    
+    # Build nuisance_specs for N-param models
+    nuisance_specs = config.get("nuisance_specs")
+    if nuisance_specs is None and degradation_model in MULTI_PARAM_MODELS:
+        model_info = MULTI_PARAM_MODELS[degradation_model]
+        nuisance_specs = []
+        for name in model_info["params"]:
+            if name == "ja":
+                nuisance_specs.append({"name": "ja", "min": config["min_param"], "max": config["max_param"]})
+            elif name == "depth":
+                nuisance_specs.append({"name": "depth", "min": config.get("min_depth", 0.1), "max": config.get("max_depth", 0.8)})
+            elif name == "rate":
+                nuisance_specs.append({"name": "rate", "min": config.get("min_rate", 0.1), "max": config.get("max_rate", 0.8)})
+            elif name == "snr":
+                nuisance_specs.append({"name": "snr", "min": config["min_param"], "max": config["max_param"]})
 
     if param_specs is not None:
         names = ", ".join(s["name"] for s in param_specs)
@@ -688,6 +704,7 @@ def main():
         mode = "classification multi-param"
     else:
         mode = "classification"
+
     print(f"Mode: {mode}")
     print(f"Device: {args.device}")
 
@@ -778,6 +795,7 @@ def main():
     if param_specs is not None:
         plot_data = evaluate_n_param(encoder, controller, test_files, config, args.device,
                                      param_specs=param_specs,
+                                     nuisance_specs=nuisance_specs,
                                      plot_path=plot_path, epoch=epoch,
                                      noise_bank=noise_bank)
     elif regression:

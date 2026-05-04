@@ -44,6 +44,11 @@ MULTI_PARAM_MODELS = {
         "chain": ["ja", "wow_flutter"],
         "needs_noise": False,
     },
+    "wf_ja": {
+        "params": ["depth", "rate", "ja"],
+        "chain": ["wow_flutter", "ja"],
+        "needs_noise": False,
+    },
     "ja_noise": {
         "params": ["ja", "snr"],
         "chain": ["ja", "tape_noise"],
@@ -487,6 +492,10 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         max_data: Optional[float] = None,
         # Multi-param specs (overrides individual min/max params)
         param_specs: Optional[list] = None,
+        # Nuisance specs: sampled for degradation but NOT used as targets
+        nuisance_specs: Optional[list] = None,
+        # Reproducibility seed
+        seed: int = 42,
     ):
         super().__init__()
         self.return_clean = return_clean
@@ -525,6 +534,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
 
         # Mode-specific setup
         self.param_specs = None
+        self.nuisance_specs = nuisance_specs or []
         if degradation_model in MULTI_PARAM_MODELS:
             self._setup_multi_param(param_specs, degradation_model,
                                     min_param, max_param, min_depth, max_depth, min_rate, max_rate)
@@ -538,7 +548,7 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
 
         # Discover and split audio files
         self.input_filepaths = self._discover_files(audio_dir, input_dirs, ext)
-        rng_split = random.Random(42)
+        rng_split = random.Random(seed)
         rng_split.shuffle(self.input_filepaths)
         self.input_filepaths = utils.split_dataset(self.input_filepaths, subset, train_frac)
 
@@ -633,6 +643,8 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         print(f"  Chain: {' → '.join(model_info['chain'])}")
         for s in self.param_specs:
             print(f"  {s['name']}: [{s['min']:.3f}, {s['max']:.3f}]")
+        for s in self.nuisance_specs:
+            print(f"  {s['name']}: [{s['min']:.3f}, {s['max']:.3f}] (nuisance)")
 
     def _setup_dual_param(self, min_param, max_param, num_classes,
                           num_classes_depth, num_classes_rate,
@@ -814,9 +826,11 @@ class TapeSaturationDataset(torch.utils.data.Dataset):
         """Apply chained degradation, return (y, *targets) with N normalized targets."""
         model_info = MULTI_PARAM_MODELS[self.degradation_model]
 
-        # Sample all parameters
+        # Sample all parameters (targets + nuisance)
         vals = {}
         for spec in self.param_specs:
+            vals[spec["name"]] = random.uniform(spec["min"], spec["max"])
+        for spec in self.nuisance_specs:
             vals[spec["name"]] = random.uniform(spec["min"], spec["max"])
 
         # Apply degradation chain

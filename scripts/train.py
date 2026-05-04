@@ -173,7 +173,7 @@ def main():
     # Determine signal loss settings before dataset creation (return_clean affects batch format)
     signal_loss_weight = config.get("signal_loss_weight", 0.0)
     param_loss_weight = config.get("param_loss_weight", 1.0)
-    use_signal_loss = config.get("regression", False)
+    use_signal_loss = config.get("regression", False) and signal_loss_weight > 0.0
 
     # Create datasets
     print("\nLoading datasets...")
@@ -182,8 +182,8 @@ def main():
         input_dirs=config.get("input_dirs"),
         ext=config["ext"],
         length=config["audio_length"],
-        min_param=config["min_param"],
-        max_param=config["max_param"],
+        min_param=config.get("min_param", 0.0),
+        max_param=config.get("max_param", 1.0),
         num_classes=config.get("num_classes", 3),
         degradation_model=config["degradation_model"],
         log_scale=config.get("log_scale", False),
@@ -215,6 +215,8 @@ def main():
         min_data=config.get("min_data"),
         max_data=config.get("max_data"),
         param_specs=param_specs,
+        nuisance_specs=config.get("nuisance_specs"),
+        seed=config.get("seed", 42),
     )
 
     train_dataset = TapeSaturationDataset(
@@ -230,8 +232,10 @@ def main():
     )
 
     # Generator for reproducibility
+    seed = config.get("seed", 42)
+    torch.manual_seed(seed)
     g = torch.Generator()
-    g.manual_seed(0)
+    g.manual_seed(seed)
 
     num_workers = config["num_workers"]
     train_loader = DataLoader(
@@ -288,8 +292,8 @@ def main():
 
         forward_model = DifferentiableForwardModel(
             degradation_model=degradation_model,
-            min_param=config["min_param"],
-            max_param=config["max_param"],
+            min_param=config.get("min_param", 0.0),
+            max_param=config.get("max_param", 1.0),
             min_depth=config.get("min_depth", 0.1),
             max_depth=config.get("max_depth", 0.8),
             min_rate=config.get("min_rate", 0.1),
@@ -337,8 +341,8 @@ def main():
         signal_loss_weight=signal_loss_weight,
         param_loss_weight=param_loss_weight,
         signal_loss_fn=signal_loss_fn,
-        min_param=config["min_param"],
-        max_param=config["max_param"],
+        min_param=config.get("min_param", 0.0),
+        max_param=config.get("max_param", 1.0),
         param_specs=param_specs,
     )
 
